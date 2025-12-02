@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.env
+
+# Progress files
+bet_progress.json
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
