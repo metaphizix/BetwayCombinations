@@ -197,10 +197,9 @@ async def login_to_betway(playwright):
     print("Checking for post-login modals/popups...")
     close_selectors = [
         'button:has-text("×")',
-        'button:has-text("Close")',
         'button:has-text("GOT IT")',
-        'button:has-text("OK")',
         'button[aria-label="Close"]',
+        'svg[id="modal-close-btn"]',
     ]
     
     for selector in close_selectors:
@@ -208,6 +207,16 @@ async def login_to_betway(playwright):
             close_btns = await page.query_selector_all(selector)
             for btn in close_btns:
                 if await btn.is_visible():
+                    # Skip buttons related to account/deposit
+                    try:
+                        btn_text = await btn.inner_text()
+                        btn_aria = await btn.get_attribute('aria-label') or ''
+                        combined = f"{btn_text} {btn_aria}".lower()
+                        if any(kw in combined for kw in ['deposit', 'account', 'profile', 'login']):
+                            continue
+                    except:
+                        pass
+                    
                     await btn.evaluate('el => el.click()')
                     await page.wait_for_timeout(500)
                     print("  Closed post-login modal/popup")
@@ -221,26 +230,177 @@ async def login_to_betway(playwright):
         "browser": browser
     }
 
+async def check_and_relogin(page: Page, browser) -> bool:
+    """
+    Check if we're still logged in. If not, re-login.
+    Returns True if logged in (or successfully re-logged in), False if re-login failed.
+    """
+    try:
+        # Check for balance element (indicates logged in)
+        balance_element = await page.query_selector('strong:has-text("Balance")')
+        if balance_element and await balance_element.is_visible():
+            return True  # Still logged in
+        
+        # Also check for username/balance in header
+        header_balance = await page.query_selector('#header-balance')
+        if header_balance:
+            text = await header_balance.inner_text()
+            if 'R' in text or 'Balance' in text:
+                return True  # Still logged in
+        
+        # Check if betslip shows "Login" button (indicates logged out)
+        betslip = await page.query_selector('div#betslip-container-mobile, div#betslip-container')
+        if betslip:
+            betslip_text = await betslip.inner_text()
+            if 'Login' in betslip_text and 'Bet Now' not in betslip_text:
+                print("\n⚠️ [SESSION EXPIRED] Detected logged out state - re-logging in...")
+            else:
+                # Might still be logged in, just can't verify
+                return True
+        
+        # If we got here, we need to re-login
+        print("🔄 [RE-LOGIN] Attempting to re-authenticate...")
+        
+        # Get credentials from env
+        username = os.getenv('BETWAY_USERNAME')
+        password = os.getenv('BETWAY_PASSWORD')
+        
+        if not username or not password:
+            print("❌ [RE-LOGIN FAILED] Credentials not found in .env")
+            return False
+        
+        # Navigate to the main page to trigger login
+        try:
+            await page.goto('https://new.betway.co.za/sport/soccer', timeout=30000)
+            await page.wait_for_timeout(2000)
+        except Exception as e:
+            print(f"❌ [RE-LOGIN FAILED] Could not navigate: {e}")
+            return False
+        
+        # Try to find and click login button
+        login_selectors = [
+            '#header-username',
+            'button:has-text("Log In")',
+            'a:has-text("Log In")',
+            'button:has-text("Login")',
+        ]
+        
+        login_opened = False
+        for selector in login_selectors:
+            try:
+                element = await page.wait_for_selector(selector, timeout=2000)
+                if element and await element.is_visible():
+                    await element.click()
+                    login_opened = True
+                    print(f"  ✓ Clicked login button: {selector}")
+                    break
+            except:
+                continue
+        
+        if not login_opened:
+            # Check if we're actually already logged in (balance visible)
+            try:
+                balance = await page.query_selector('strong:has-text("Balance")')
+                if balance and await balance.is_visible():
+                    print("  ✓ Already logged in!")
+                    return True
+            except:
+                pass
+            print("❌ [RE-LOGIN FAILED] Could not find login button")
+            return False
+        
+        # Wait for login modal
+        await page.wait_for_timeout(1500)
+        
+        # Fill credentials
+        try:
+            modal_username = await page.wait_for_selector('input[placeholder="Mobile Number"]', timeout=5000)
+            await modal_username.fill(username)
+            
+            modal_password = await page.query_selector('input[placeholder="Enter Password"]')
+            await modal_password.fill(password)
+            
+            await modal_password.press('Enter')
+            print("  ✓ Credentials submitted")
+        except Exception as e:
+            print(f"❌ [RE-LOGIN FAILED] Could not fill credentials: {e}")
+            return False
+        
+        # Wait and verify login
+        await page.wait_for_timeout(3000)
+        
+        for attempt in range(5):
+            try:
+                balance_element = await page.wait_for_selector('strong:has-text("Balance")', timeout=2000)
+                if balance_element:
+                    parent = await balance_element.evaluate_handle('el => el.closest("div")')
+                    balance_text = await parent.inner_text()
+                    balance_clean = balance_text.replace('\n', ' ').strip()
+                    print(f"✅ [RE-LOGIN SUCCESS] {balance_clean}")
+                    
+                    # Close any post-login modals
+                    await close_all_modals(page, max_attempts=2)
+                    return True
+            except:
+                if attempt < 4:
+                    await page.wait_for_timeout(1000)
+        
+        print("❌ [RE-LOGIN FAILED] Could not verify login after re-authentication")
+        return False
+        
+    except Exception as e:
+        print(f"❌ [RE-LOGIN ERROR] {e}")
+        return False
+
 async def close_all_modals(page: Page, max_attempts=3):
     """
     Aggressively attempt to close all modals/popups that might appear.
     Tries multiple times with various selectors, including betslip modal.
+    IMPORTANT: Avoids clicking on account/profile related elements.
     """
     for attempt in range(max_attempts):
         try:
+            # FIRST: Check for and close Account Options modal (Deposit funds tab)
+            # This modal sometimes appears unexpectedly
+            try:
+                account_modal_indicators = [
+                    'text="Account Options"',
+                    'text="Deposit funds"',
+                    'text="27614220968"',  # Account number pattern
+                    ':has-text("Account Options")',
+                ]
+                for indicator in account_modal_indicators:
+                    try:
+                        modal_elem = await page.query_selector(indicator)
+                        if modal_elem and await modal_elem.is_visible():
+                            print(f"    ⚠️ Detected Account Options modal - closing...")
+                            # Press Escape to close modal
+                            await page.keyboard.press('Escape')
+                            await asyncio.sleep(0.5)
+                            
+                            # Also try clicking outside the modal or close button
+                            close_btns = await page.query_selector_all('svg[id="modal-close-btn"], button[aria-label="Close"]')
+                            for close_btn in close_btns:
+                                if await close_btn.is_visible():
+                                    await close_btn.click()
+                                    await asyncio.sleep(0.3)
+                                    break
+                            break
+                    except:
+                        continue
+            except:
+                pass
+            
             # Try various close button selectors (including betslip close from HTML)
+            # IMPORTANT: These selectors are specific to CLOSE buttons only, not action buttons
             close_selectors = [
-                'svg[id="modal-close-btn"]',  # Betslip and modal close button
-                'button[id*="close"]',
-                'button[aria-label*="Close"]',
-                'button[aria-label*="close"]',
-                '[class*="close"]',
-                '.modal-close',
-                'div[role="dialog"] button',
-                '[class*="modal"] button',
-                '[class*="popup"] button',
-                'button:has-text("×")',
-                'button:has-text("Close")',
+                'svg[id="modal-close-btn"]',  # Betslip and modal close button (specific ID)
+                'button[aria-label="Close"]',  # Exact match for Close button
+                'button[aria-label="close"]',  # Exact match lowercase
+                'button:has-text("×")',  # X button
+                'button:has-text("Close"):not([aria-label*="Account"])',  # Close text but not account related
+                'button:has-text("GOT IT")',  # Common popup dismiss
+                'button:has-text("OK"):not([id*="deposit"]):not([id*="account"])',  # OK button but not deposit/account
             ]
             
             closed_any = False
@@ -249,13 +409,27 @@ async def close_all_modals(page: Page, max_attempts=3):
                     close_buttons = await page.query_selector_all(selector)
                     for btn in close_buttons:
                         if await btn.is_visible():
+                            # CRITICAL: Skip buttons that might be account/deposit related
+                            try:
+                                btn_text = await btn.inner_text()
+                                btn_aria = await btn.get_attribute('aria-label') or ''
+                                btn_id = await btn.get_attribute('id') or ''
+                                
+                                # Skip if this looks like an account/deposit/profile button
+                                skip_keywords = ['deposit', 'account', 'profile', 'login', 'sign', 'register', 'withdraw']
+                                combined_text = f"{btn_text} {btn_aria} {btn_id}".lower()
+                                if any(keyword in combined_text for keyword in skip_keywords):
+                                    continue
+                            except:
+                                pass
+                            
                             await btn.click()
                             closed_any = True
                             await asyncio.sleep(0.3)
                 except Exception:
                     continue
             
-            # Try Escape key as well
+            # Try Escape key as well (safest way to close modals)
             try:
                 await page.keyboard.press('Escape')
                 await asyncio.sleep(0.3)
@@ -466,11 +640,29 @@ def generate_bet_combinations(matches, num_matches):
         bet_slips.append(slip)
     
     print(f"\n✅ Generated {len(bet_slips)} VALID tickets")
-    print(f"\nEach ticket bets on ALL {num_matches} matches with DIFFERENT outcome predictions:")
-    print(f"  Example: Ticket 1 = Match1:1, Match2:1")
-    print(f"           Ticket 2 = Match1:1, Match2:X")
-    print(f"           Ticket 3 = Match1:1, Match2:2")
-    print(f"  This is a MULTI-BET (accumulator) where ALL selections must win.")
+    
+    # Show dynamic examples based on number of matches
+    if num_matches == 1:
+        print(f"\nEach ticket bets on the SAME match with a DIFFERENT outcome prediction:")
+        print(f"  Ticket 1 = Match1:1 (Home Win)")
+        print(f"  Ticket 2 = Match1:X (Draw)")
+        print(f"  Ticket 3 = Match1:2 (Away Win)")
+        print(f"  This is a SINGLE BET - one of these will always win!")
+    elif num_matches == 2:
+        print(f"\nEach ticket bets on ALL {num_matches} matches with DIFFERENT outcome predictions:")
+        print(f"  Ticket 1 = Match1:1, Match2:1")
+        print(f"  Ticket 2 = Match1:1, Match2:X")
+        print(f"  Ticket 3 = Match1:1, Match2:2")
+        print(f"  ... (9 total combinations)")
+        print(f"  This is a MULTI-BET (accumulator) where ALL selections must win.")
+    else:
+        print(f"\nEach ticket bets on ALL {num_matches} matches with DIFFERENT outcome predictions:")
+        examples = [f"Match{i+1}:1" for i in range(min(num_matches, 3))]
+        if num_matches > 3:
+            examples.append("...")
+        print(f"  Ticket 1 = {', '.join(examples)}")
+        print(f"  ... ({len(bet_slips)} total combinations)")
+        print(f"  This is a MULTI-BET (accumulator) where ALL selections must win.")
     
     return bet_slips
 
@@ -530,13 +722,24 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
         
         # VERIFY betslip is actually empty
         await page.wait_for_timeout(500)
+        betslip_has_selections = False
         try:
             betslip_check = await page.query_selector('div#betslip-container-mobile')
             if not betslip_check:
                 betslip_check = await page.query_selector('div#betslip-container')
             if betslip_check:
                 betslip_text = await betslip_check.inner_text()
-                if '1X2' in betslip_text or 'Multi' in betslip_text:
+                # Check for actual bet selections - look for odds values (like "2.55" or team names with odds)
+                # Empty betslip has "Single" and "Multi" tabs but no actual selections
+                # A bet selection would have patterns like: team name + odds, or "Total Betway Return" with a value
+                has_odds_value = bool(re.search(r'\d+\.\d{2}', betslip_text))  # Odds like 2.55, 3.15
+                has_return_value = 'Total Betway Return' in betslip_text and 'R ' in betslip_text
+                has_bet_button = 'Bet Now' in betslip_text
+                
+                # Betslip has actual selections if it has odds AND (return value OR bet button)
+                betslip_has_selections = has_odds_value and (has_return_value or has_bet_button)
+                
+                if betslip_has_selections:
                     print("    ⚠️  WARNING: Betslip not empty after reload! Attempting to clear...")
                     # Try clicking remove all button
                     try:
@@ -545,16 +748,23 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             await remove_all.click()
                             await page.wait_for_timeout(500)
                             print("    ✅ Clicked 'Remove All' button")
+                        else:
+                            # Alternative: try to reload the page again
+                            await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                            await page.wait_for_timeout(1000)
+                            print("    [OK] Page reloaded - betslip is empty")
                     except:
                         pass
         except Exception as e:
             print(f"    Could not verify betslip: {e}")
         
-        print("    [OK] Page reloaded - betslip is empty")
+        if not betslip_has_selections:
+            print("    [OK] Betslip is empty - ready to add selections")
         
         # Click on each match outcome
         for i, (match, selection) in enumerate(zip(matches, selections)):
-            print(f"  Match {i+1}: {match['name']} - Selecting: {selection}")
+            start_time = match.get('start_time', 'Unknown time')
+            print(f"  Match {i+1}: {match['name']} | ⏰ {start_time} - Selecting: {selection}")
             
             expected_time = match.get('start_time')
             expected_team1 = match.get('team1')
@@ -621,16 +831,84 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     
                     if len(outcome_buttons) >= 3 and selection_index < len(outcome_buttons):
                         outcome_btn = outcome_buttons[selection_index]
-                        try:
-                            await outcome_btn.scroll_into_view_if_needed()
-                            await page.wait_for_timeout(300)
-                            await outcome_btn.click()
-                            await page.wait_for_timeout(1000)
-                            cache_status = "[CACHED]" if (outcome_button_cache and match_url in outcome_button_cache) else ""
-                            print(f"    ✓ Clicked outcome '{selection}' {cache_status}")
-                        except Exception as click_err:
-                            print(f"    ❌ ERROR clicking button: {click_err}")
+                        selection_confirmed = False
+                        max_click_attempts = 3
+                        
+                        for click_attempt in range(max_click_attempts):
+                            try:
+                                # Re-query buttons on retry to ensure fresh DOM elements
+                                if click_attempt > 0:
+                                    print(f"    🔄 Retry {click_attempt + 1}/{max_click_attempts}: Re-querying buttons...")
+                                    await page.wait_for_timeout(1000)
+                                    
+                                    # Try to find buttons again with cached selector
+                                    if outcome_button_cache and match_url in outcome_button_cache:
+                                        cached_selector = outcome_button_cache[match_url]
+                                        fresh_buttons = await page.query_selector_all(cached_selector)
+                                        if len(fresh_buttons) >= 3:
+                                            outcome_btn = fresh_buttons[selection_index]
+                                        else:
+                                            # Try fallback selectors
+                                            for sel in ['div[price]', 'div.grid.p-1 > div.flex.items-center']:
+                                                fresh_buttons = await page.query_selector_all(sel)
+                                                if len(fresh_buttons) >= 3:
+                                                    outcome_btn = fresh_buttons[selection_index]
+                                                    break
+                                
+                                await outcome_btn.scroll_into_view_if_needed()
+                                await page.wait_for_timeout(300)
+                                
+                                # Try multiple click methods
+                                try:
+                                    await outcome_btn.click()
+                                except:
+                                    try:
+                                        await outcome_btn.evaluate('el => el.click()')
+                                    except:
+                                        await outcome_btn.dispatch_event('click')
+                                
+                                await page.wait_for_timeout(1500)
+                                cache_status = "[CACHED]" if (outcome_button_cache and match_url in outcome_button_cache) else ""
+                                print(f"    ✓ Clicked outcome '{selection}' {cache_status}")
+                                
+                                # VERIFY: Check if selection was added to betslip
+                                await page.wait_for_timeout(500)
+                                betslip_check = await page.query_selector('div#betslip-container-mobile, div#betslip-container')
+                                if betslip_check:
+                                    betslip_text = await betslip_check.inner_text()
+                                    # Look for indicators that a bet was added (not just header)
+                                    has_selection = ('Single' in betslip_text and '1' in betslip_text) or \
+                                                   ('Multi' in betslip_text and '1' in betslip_text) or \
+                                                   '1X2' in betslip_text or \
+                                                   'Return' in betslip_text
+                                    
+                                    # Also check betslip isn't just showing the empty header
+                                    betslip_has_content = len(betslip_text) > 100  # Empty betslip is very short
+                                    
+                                    if has_selection and betslip_has_content:
+                                        print(f"    ✓ Selection confirmed in betslip")
+                                        selection_confirmed = True
+                                        break
+                                    else:
+                                        print(f"    ⚠️ Selection not detected in betslip (attempt {click_attempt + 1}/{max_click_attempts})")
+                                        if click_attempt < max_click_attempts - 1:
+                                            # Try scrolling to refresh the view
+                                            await page.evaluate('window.scrollTo(0, 0)')
+                                            await page.wait_for_timeout(300)
+                                            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                                else:
+                                    print(f"    ⚠️ Could not find betslip container (attempt {click_attempt + 1}/{max_click_attempts})")
+                                    
+                            except Exception as click_err:
+                                print(f"    ⚠️ Click attempt {click_attempt + 1} failed: {click_err}")
+                                if click_attempt == max_click_attempts - 1:
+                                    print(f"    ❌ ERROR clicking button after {max_click_attempts} attempts")
+                                    return False
+                        
+                        if not selection_confirmed:
+                            print(f"    ❌ ERROR: Could not confirm selection was added to betslip after {max_click_attempts} attempts")
                             return False
+                            
                     else:
                         print(f"    ❌ ERROR: Could not find outcome buttons on match page (found {len(outcome_buttons)} buttons)")
                         print(f"    Page URL: {page.url}")
@@ -655,15 +933,139 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
         # Wait for betslip to fully update with all selections
         await page.wait_for_timeout(1000)
         
+        # CRITICAL: Scroll to make betslip visible and wait for it to load
+        print("  Scrolling to betslip...")
+        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+        await page.wait_for_timeout(1000)
+        
+        # Try to click betslip toggle button if it exists (mobile view may have collapsed betslip)
+        try:
+            betslip_toggle_selectors = [
+                'button[aria-label*="Betslip"]',
+                'div#betslip-toggle',
+                'button:has-text("Betslip")',
+                'div.betslip-toggle',
+            ]
+            for toggle_sel in betslip_toggle_selectors:
+                try:
+                    toggle_btn = await page.query_selector(toggle_sel)
+                    if toggle_btn and await toggle_btn.is_visible():
+                        await toggle_btn.click()
+                        print(f"    Clicked betslip toggle: {toggle_sel}")
+                        await page.wait_for_timeout(1000)
+                        break
+                except:
+                    continue
+        except:
+            pass
+        
         # Enter bet amount
         print(f"  Entering bet amount: R {amount:.2f}")
         try:
-            # Try multiple selectors (ID is most reliable)
-            stake_input = await page.query_selector('#bet-amount-input')
-            if not stake_input:
-                stake_input = await page.query_selector('input[placeholder="0.00"]')
-            if not stake_input:
-                stake_input = await page.query_selector('input[type="number"][inputmode="decimal"]')
+            # Try multiple selectors with retries (betslip may take time to appear)
+            stake_input = None
+            stake_selectors = [
+                '#bet-amount-input',
+                'input[placeholder="0.00"]',
+                'input[type="number"][inputmode="decimal"]',
+                'div#betslip-container-mobile input[type="number"]',
+                'div#betslip-container input[type="number"]',
+                'input[id*="bet-amount"]',
+                'input[class*="stake"]',
+                'input[placeholder*="0"]',  # Any placeholder with 0
+            ]
+            
+            # Try to find stake input with retries (up to 5 attempts, 1 second apart)
+            for find_attempt in range(5):
+                for selector in stake_selectors:
+                    try:
+                        stake_input = await page.query_selector(selector)
+                        if stake_input and await stake_input.is_visible():
+                            print(f"    Found stake input using: {selector}")
+                            break
+                    except:
+                        continue
+                
+                if stake_input:
+                    break
+                
+                # If not found, try additional recovery steps
+                if find_attempt < 4:
+                    print(f"    ⏳ Stake input not found, retrying ({find_attempt + 1}/5)...")
+                    
+                    # Try scrolling in different ways
+                    if find_attempt == 0:
+                        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    elif find_attempt == 1:
+                        # Try clicking on the betslip header/panel to expand it
+                        try:
+                            betslip_header_selectors = [
+                                'span:has-text("Betslip")',
+                                'div#betslip-container-mobile',
+                                'div#betslip-container',
+                                'div[class*="betslip"] span',
+                            ]
+                            for header_sel in betslip_header_selectors:
+                                try:
+                                    header = await page.query_selector(header_sel)
+                                    if header and await header.is_visible():
+                                        await header.click()
+                                        print(f"    Clicked betslip header to expand")
+                                        await page.wait_for_timeout(500)
+                                        break
+                                except:
+                                    continue
+                        except:
+                            pass
+                        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    elif find_attempt == 2:
+                        # Try clicking on the Single tab in betslip (for single bets)
+                        try:
+                            single_tab = await page.query_selector('button:has-text("Single")')
+                            if single_tab and await single_tab.is_visible():
+                                await single_tab.click()
+                                print(f"    Clicked 'Single' tab to show stake input")
+                                await page.wait_for_timeout(500)
+                        except:
+                            pass
+                        # Also try Multi tab
+                        try:
+                            multi_tab = await page.query_selector('div#betslip-container-mobile button:has-text("Multi")')
+                            if not multi_tab:
+                                multi_tab = await page.query_selector('button:has-text("Multi")')
+                            if multi_tab and await multi_tab.is_visible():
+                                await multi_tab.click()
+                                print(f"    Clicked 'Multi' tab to show stake input")
+                        except:
+                            pass
+                    elif find_attempt == 3:
+                        # Debug: Print what's in the betslip container
+                        try:
+                            betslip = await page.query_selector('div#betslip-container-mobile')
+                            if not betslip:
+                                betslip = await page.query_selector('div#betslip-container')
+                            if betslip:
+                                betslip_html = await betslip.inner_html()
+                                print(f"    🔍 Debug: Betslip HTML (first 500 chars): {betslip_html[:500]}")
+                            else:
+                                print(f"    🔍 Debug: No betslip container found!")
+                                
+                            # Also list all input elements on page
+                            all_inputs = await page.query_selector_all('input')
+                            print(f"    🔍 Debug: Found {len(all_inputs)} input elements on page")
+                            for idx, inp in enumerate(all_inputs[:5]):
+                                try:
+                                    inp_id = await inp.get_attribute('id') or 'no-id'
+                                    inp_type = await inp.get_attribute('type') or 'no-type'
+                                    inp_placeholder = await inp.get_attribute('placeholder') or 'no-placeholder'
+                                    inp_visible = await inp.is_visible()
+                                    print(f"      Input {idx+1}: id={inp_id}, type={inp_type}, placeholder={inp_placeholder}, visible={inp_visible}")
+                                except:
+                                    pass
+                        except Exception as debug_err:
+                            print(f"    🔍 Debug error: {debug_err}")
+                    
+                    await page.wait_for_timeout(1000)
             
             if stake_input:
                 print("    Found stake input, setting value...")
@@ -734,6 +1136,10 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
         max_retries = 5
         
         for retry in range(max_retries):
+            # Scroll down to ensure betslip is visible
+            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+            await page.wait_for_timeout(500)
+            
             # Get betslip content for validation
             betslip_container = await page.query_selector('div#betslip-container-mobile')
             if not betslip_container:
@@ -749,16 +1155,47 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                 has_return_calculation = 'Return' in betslip_text or 'Total' in betslip_text
                 has_odds = any(char.isdigit() and '.' in betslip_text for char in betslip_text)
                 
-                # CRITICAL: Must verify stake amount is actually shown in betslip
+                # Check for stake amount - look for the actual stake value OR verify return is calculated
                 stake_str = str(amount)
-                has_stake = stake_str in betslip_text or f"R {stake_str}" in betslip_text or f"R{stake_str}" in betslip_text
+                # Also check for amount without decimal if it's a whole number
+                stake_int_str = str(int(amount)) if amount == int(amount) else None
                 
-                # Changed validation: MUST have stake amount visible (not just return calculation)
-                if has_bet_button and has_return_calculation and has_stake:
+                # Betslip shows stake in different ways - check for any of them
+                has_stake = (
+                    stake_str in betslip_text or 
+                    f"R {stake_str}" in betslip_text or 
+                    f"R{stake_str}" in betslip_text or
+                    (stake_int_str and f"R {stake_int_str}" in betslip_text) or
+                    (stake_int_str and f"R{stake_int_str}" in betslip_text)
+                )
+                
+                # ALTERNATIVE: If return is shown with a valid amount, stake was entered
+                # Check if there's a return value that makes sense (return = stake * odds)
+                has_valid_return = False
+                if has_return_calculation:
+                    # Look for "Return:R X.XX" pattern - if present, stake was entered
+                    return_match = re.search(r'Return[:\s]*R\s*(\d+\.?\d*)', betslip_text)
+                    if return_match:
+                        return_value = float(return_match.group(1))
+                        # If return is greater than 0, stake was entered
+                        if return_value > 0:
+                            has_valid_return = True
+                
+                # Betslip is ready if: has bet button AND (stake visible OR valid return calculated)
+                if has_bet_button and (has_stake or has_valid_return):
                     betslip_ready = True
-                    print(f"    ✓ Betslip is READY with stake amount visible (retry {retry + 1}/{max_retries})")
+                    print(f"    ✓ Betslip is READY (retry {retry + 1}/{max_retries})")
                     break
                 else:
+                    # Check if session expired (Login button appears instead of Bet Now)
+                    # Look for "Login" right before "share" which indicates the button position
+                    is_logged_out = ('Login' in betslip_text and 'Bet Now' not in betslip_text) or \
+                                   ('Loginshare' in betslip_text.replace(' ', ''))
+                    
+                    if is_logged_out:
+                        print(f"    ⚠️ [SESSION EXPIRED] Detected 'Login' instead of 'Bet Now' - attempting re-login...")
+                        return "RELOGIN"  # Signal that re-login is needed
+                    
                     # Show which validation failed
                     missing = []
                     if not has_bet_button:
@@ -768,17 +1205,22 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     if not has_stake:
                         missing.append(f"Stake ({stake_str})")
                     print(f"    ⏳ Missing: {', '.join(missing)} (retry {retry + 1}/{max_retries})")
+                    
+                    # Debug: print first 200 chars of betslip content on last retry
+                    if retry == max_retries - 1:
+                        print(f"    🔍 Debug betslip content: {betslip_text[:200]}")
                 
                 if retry < max_retries - 1:
                     await page.wait_for_timeout(1000)
             else:
+                print(f"    ⚠️ Could not find betslip container (retry {retry + 1}/{max_retries})")
                 if retry < max_retries - 1:
                     await page.wait_for_timeout(1000)
         
         if not betslip_ready:
             print(f"    ❌ [ERROR] Betslip not ready after {max_retries} retries - stake amount not visible!")
             print(f"    This usually means the amount wasn't entered correctly")
-            return False
+            return "RETRY"  # Return RETRY instead of False to trigger automatic retry
         
         # Get betslip content for debugging (try mobile container first from HTML)
         betslip_container = await page.query_selector('div#betslip-container-mobile')
@@ -896,6 +1338,16 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             print(f"    ⚠️  Skipping sign-up button (selector: {selector})")
                             continue
                         
+                        # CRITICAL: Get button text and verify it's not account-related
+                        try:
+                            btn_text = (await btn.inner_text()).lower()
+                            skip_keywords = ['account', 'deposit', 'withdraw', 'profile', 'login', 'sign', 'register']
+                            if any(kw in btn_text for kw in skip_keywords):
+                                print(f"    ⚠️  Skipping account-related button: '{btn_text}' (selector: {selector})")
+                                continue
+                        except:
+                            pass
+                        
                         if is_visible and is_enabled:
                             place_bet_btn = btn
                             successful_selector = selector
@@ -951,17 +1403,51 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
             
             # Helper function to check if confirmation modal appeared
             async def check_for_modal():
-                # Check for any confirmation-related elements
-                modal_selectors = [
+                # FIRST: Check if this is an Account Options modal (NOT a bet confirmation)
+                # Account modal has unique identifiers we should exclude
+                account_modal_indicators = [
+                    '#deposit-account-nav',
+                    '#withdraw-account-nav', 
+                    '#banking-iframe-deposit',
+                    'text="Account Options"',
+                    'text="Deposit funds"',
+                    '[aria-label="Deposit funds"]',
+                ]
+                
+                for indicator in account_modal_indicators:
+                    try:
+                        elem = await page.query_selector(indicator)
+                        if elem and await elem.is_visible():
+                            print(f"    ⚠️ [check_for_modal] Detected Account modal (not bet confirmation) - indicator: {indicator}")
+                            return False  # This is NOT a bet confirmation modal
+                    except:
+                        continue
+                
+                # Check for SPECIFIC bet confirmation elements (not generic modal selectors)
+                # These are unique to the bet confirmation modal
+                confirmation_selectors = [
+                    'button#strike-conf-continue-btn',  # "Continue betting" button - most specific
+                    'span:has-text("Bet Confirmation")',  # Title of confirmation modal
+                    'button:has-text("Continue betting")',  # Text of continue button
+                    'div:has-text("Your bet has been placed")',  # Success message
+                ]
+                
+                for selector in confirmation_selectors:
+                    try:
+                        element = await page.query_selector(selector)
+                        if element and await element.is_visible():
+                            print(f"    ✓ [check_for_modal] Found bet confirmation element: {selector}")
+                            return True
+                    except:
+                        pass
+                
+                # Fallback: check generic modal but verify it's not Account modal
+                generic_modal_selectors = [
                     'button:has-text("Confirm")',
                     'button:has-text("Place Bet")',
                     'button:has-text("OK")',
-                    'span:has-text("Bet Confirmation")',
-                    'div[role="dialog"]',
-                    'div[class*="modal"]',
-                    'button#strike-conf-continue-btn',
                 ]
-                for selector in modal_selectors:
+                for selector in generic_modal_selectors:
                     try:
                         element = await page.query_selector(selector)
                         if element and await element.is_visible():
@@ -969,6 +1455,78 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     except:
                         pass
                 return False
+            
+            # Helper function to check for and close Account Options modal
+            async def check_and_close_account_modal():
+                """Detects and closes the Account Options / Deposit funds modal that sometimes appears"""
+                # Use more specific selectors based on the actual modal HTML
+                account_indicators = [
+                    '#deposit-account-nav',  # Most reliable - the deposit nav tab
+                    '#withdraw-account-nav',  # Withdraw nav tab
+                    '#banking-iframe-deposit',  # Banking iframe
+                    '[aria-label="Deposit funds"]',  # Aria label
+                    'text="Account Options"',
+                    'text="Deposit funds"',
+                ]
+                
+                detected = False
+                for indicator in account_indicators:
+                    try:
+                        elem = await page.query_selector(indicator)
+                        if elem and await elem.is_visible():
+                            detected = True
+                            print(f"    ⚠️ [ACCOUNT MODAL] Detected via: {indicator}")
+                            break
+                    except:
+                        continue
+                
+                if not detected:
+                    return False
+                    
+                print(f"    ⚠️ [ACCOUNT MODAL] Closing Account Options/Deposit modal...")
+                
+                # Try pressing Escape first
+                await page.keyboard.press('Escape')
+                await page.wait_for_timeout(500)
+                
+                # Check if it's still there using the most reliable indicator
+                still_visible = False
+                for indicator in account_indicators[:3]:  # Check the reliable selectors
+                    try:
+                        elem = await page.query_selector(indicator)
+                        if elem and await elem.is_visible():
+                            still_visible = True
+                            break
+                    except:
+                        continue
+                
+                if still_visible:
+                    # Try clicking close button
+                    close_selectors = [
+                        'svg[id="modal-close-btn"]',
+                        '#modal-close-btn',
+                        'button[aria-label="Close"]',
+                        'button:has-text("×")',
+                        '.modal-close-btn',
+                    ]
+                    for close_sel in close_selectors:
+                        try:
+                            close_btns = await page.query_selector_all(close_sel)
+                            for close_btn in close_btns:
+                                if await close_btn.is_visible():
+                                    await close_btn.click()
+                                    await page.wait_for_timeout(300)
+                                    print(f"    ✓ Clicked close button: {close_sel}")
+                                    break
+                        except:
+                            continue
+                    
+                    # Press Escape again as backup
+                    await page.keyboard.press('Escape')
+                    await page.wait_for_timeout(300)
+                
+                print(f"    ✓ Account modal closed")
+                return True
             
             # Helper function to re-query button (Betway re-renders the betslip)
             async def get_fresh_button():
@@ -1007,6 +1565,11 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             await fresh_btn.evaluate('el => el.click()')
                             await page.wait_for_timeout(1500)  # Increased wait for modal
                     
+                    # CRITICAL: Check if Account Options modal appeared instead of bet confirmation
+                    account_modal_closed = await check_and_close_account_modal()
+                    if account_modal_closed:
+                        print("    ⚠️ Account modal was triggered instead of bet - will retry")
+                    
                     modal_appeared = await check_for_modal()
                     if modal_appeared:
                         print("    ✅ Method 1: JavaScript click SUCCESS - modal appeared!")
@@ -1023,6 +1586,12 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     if fresh_btn:
                         await fresh_btn.click(timeout=3000, force=True)
                     await page.wait_for_timeout(1000)
+                    
+                    # Check for Account Options modal
+                    account_modal_closed = await check_and_close_account_modal()
+                    if account_modal_closed:
+                        print("    ⚠️ Account modal was triggered instead of bet - will retry")
+                    
                     modal_appeared = await check_for_modal()
                     if modal_appeared:
                         print("    ✅ Method 2: Direct click SUCCESS - modal appeared!")
@@ -1039,6 +1608,12 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     if fresh_btn:
                         await fresh_btn.dispatch_event('click')
                     await page.wait_for_timeout(1000)
+                    
+                    # Check for Account Options modal
+                    account_modal_closed = await check_and_close_account_modal()
+                    if account_modal_closed:
+                        print("    ⚠️ Account modal was triggered instead of bet - will retry")
+                    
                     modal_appeared = await check_for_modal()
                     if modal_appeared:
                         print("    ✅ Method 3: Dispatch click SUCCESS - modal appeared!")
@@ -1057,6 +1632,12 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                         await page.wait_for_timeout(300)
                     await page.keyboard.press('Enter')
                     await page.wait_for_timeout(1000)
+                    
+                    # Check for Account Options modal
+                    account_modal_closed = await check_and_close_account_modal()
+                    if account_modal_closed:
+                        print("    ⚠️ Account modal was triggered instead of bet - will retry")
+                    
                     modal_appeared = await check_for_modal()
                     if modal_appeared:
                         print("    ✅ Method 4: Enter key SUCCESS - modal appeared!")
@@ -1077,6 +1658,12 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             y = box['y'] + box['height'] / 2
                             await page.mouse.click(x, y)
                         await page.wait_for_timeout(1000)
+                        
+                        # Check for Account Options modal
+                        account_modal_closed = await check_and_close_account_modal()
+                        if account_modal_closed:
+                            print("    ⚠️ Account modal was triggered instead of bet - will retry")
+                        
                         modal_appeared = await check_for_modal()
                         if modal_appeared:
                             print("    ✅ Method 5: Mouse click SUCCESS - modal appeared!")
@@ -1085,6 +1672,47 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             print("    ✗ Method 5: Mouse click but no modal appeared")
                 except Exception as e:
                     print(f"    ✗ Method 5 failed: {e}")
+            
+            # Method 6: Force page refresh and try again with fresh DOM
+            if not modal_appeared:
+                try:
+                    print("    ⚠️ Trying Method 6: Page refresh and retry...")
+                    # Reload the current match page to get fresh DOM
+                    current_url = page.url
+                    await page.reload(wait_until='domcontentloaded', timeout=15000)
+                    await page.wait_for_timeout(2000)
+                    await close_all_modals(page)
+                    
+                    # Re-enter the bet amount since page was reloaded
+                    stake_input = await page.query_selector('#bet-amount-input')
+                    if not stake_input:
+                        stake_input = await page.query_selector('input[placeholder="0.00"]')
+                    if stake_input:
+                        await stake_input.evaluate('''(el, amt) => {
+                            el.value = '';
+                            el.focus();
+                            el.value = amt;
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            el.blur();
+                        }''', str(amount))
+                        await page.wait_for_timeout(1500)
+                    
+                    # Try to click the fresh button
+                    fresh_btn = await get_fresh_button()
+                    if fresh_btn:
+                        await fresh_btn.scroll_into_view_if_needed()
+                        await page.wait_for_timeout(500)
+                        await fresh_btn.click(timeout=3000, force=True)
+                        await page.wait_for_timeout(1500)
+                        modal_appeared = await check_for_modal()
+                        if modal_appeared:
+                            print("    ✅ Method 6: Reload + click SUCCESS - modal appeared!")
+                            click_success = True
+                        else:
+                            print("    ✗ Method 6: Reload + click but no modal appeared")
+                except Exception as e:
+                    print(f"    ✗ Method 6 failed: {e}")
             
             if not click_success or not modal_appeared:
                 print("    ❌ [ERROR] All click methods failed to trigger modal!")
@@ -1108,12 +1736,66 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     print(f"    🔍 Button debug info: {button_info}")
                 except:
                     pass
-                return False
+                # Return special code to indicate retry needed
+                return "RETRY"
             
             print("    ✅ Bet Now button clicked and confirmation modal appeared!")
             
             # Modal already appeared, no need to wait again
             await page.wait_for_timeout(500)
+            
+            # CRITICAL: Check for PRICE CHANGE modal first and accept new odds
+            # Price change modals appear when odds change between selection and placement
+            price_change_handled = False
+            price_change_selectors = [
+                'button:has-text("Accept")',
+                'button:has-text("Accept Changes")',
+                'button:has-text("Accept New Odds")',
+                'button:has-text("Accept Odds")',
+                'button:has-text("Accept Price")',
+                'button:has-text("Accept new price")',
+                'button:has-text("Confirm")',
+                'button[aria-label*="Accept"]',
+                'button[id*="accept"]',
+                'button.p-button:has-text("Accept")',
+            ]
+            
+            for price_selector in price_change_selectors:
+                try:
+                    accept_btn = await page.query_selector(price_selector)
+                    if accept_btn and await accept_btn.is_visible():
+                        # Check if this is a price change modal by looking for price-related text
+                        try:
+                            modal_text = await page.query_selector('div[role="dialog"], div[class*="modal"]')
+                            if modal_text:
+                                text_content = await modal_text.inner_text()
+                                text_lower = text_content.lower()
+                                if any(keyword in text_lower for keyword in ['price', 'odds', 'changed', 'new', 'updated', 'different']):
+                                    print(f"    ⚠️ [PRICE CHANGE] Detected price change modal - accepting new odds...")
+                                    await accept_btn.click()
+                                    await page.wait_for_timeout(1500)
+                                    price_change_handled = True
+                                    print(f"    ✓ Price change accepted!")
+                                    break
+                        except:
+                            pass
+                        
+                        # Even if we can't verify it's a price modal, try clicking Accept
+                        if not price_change_handled:
+                            btn_text = await accept_btn.inner_text()
+                            if 'accept' in btn_text.lower():
+                                print(f"    ⚠️ [PRICE CHANGE] Found Accept button - clicking...")
+                                await accept_btn.click()
+                                await page.wait_for_timeout(1500)
+                                price_change_handled = True
+                                print(f"    ✓ Accepted!")
+                                break
+                except:
+                    continue
+            
+            if price_change_handled:
+                # After accepting price change, we need to wait for the bet to complete
+                await page.wait_for_timeout(1000)
             
             # CRITICAL: Try all possible confirmation buttons
             confirmation_selectors = [
@@ -1165,16 +1847,23 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                 bet_conf_modal = await page.query_selector('span:has-text("Bet Confirmation")')
                 if bet_conf_modal:
                     print("    ✅ Found 'Bet Confirmation' modal - bet successful!")
-                    # Try to close the modal
+                    # Try to close the modal using specific selectors only
                     close_selectors = [
-                        'svg#modal-close-btn',
-                        'button[aria-label*="Close"]',
-                        'svg[class*="cursor-pointer"]',
+                        'svg#modal-close-btn',  # Specific modal close button
+                        'button#strike-conf-continue-btn',  # Continue betting button
+                        'button[aria-label="Close"]',  # Exact match close button
                     ]
                     for close_sel in close_selectors:
                         try:
                             close_btn = await page.wait_for_selector(close_sel, timeout=2000, state='visible')
                             if close_btn:
+                                # Verify it's not an account-related button
+                                try:
+                                    btn_text = await close_btn.inner_text()
+                                    if 'deposit' in btn_text.lower() or 'account' in btn_text.lower():
+                                        continue
+                                except:
+                                    pass
                                 await close_btn.click()
                                 await page.wait_for_timeout(1000)
                                 print("    ✅ Closed confirmation modal")
@@ -1320,6 +2009,9 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
         # Check for existing progress file FIRST (before scraping)
         progress_file = 'bet_progress.json'
         resume_data = None
+        saved_matches = None  # Will hold saved match data if resuming
+        skip_scraping = False
+        
         if os.path.exists(progress_file):
             try:
                 with open(progress_file, 'r') as f:
@@ -1329,7 +2021,30 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
                     print(f"{'='*60}")
                     print(f"Last completed bet: {resume_data.get('last_completed_bet', 0)}")
                     print(f"Successful: {resume_data.get('successful', 0)} | Failed: {resume_data.get('failed', 0)}")
-                    print(f"Will validate matches and resume if they match...")
+                    
+                    # Check if we have saved match data
+                    if 'matches_data' in resume_data:
+                        saved_timestamp = resume_data.get('timestamp', '')
+                        if saved_timestamp:
+                            try:
+                                saved_time = datetime.fromisoformat(saved_timestamp)
+                                time_since_save = datetime.now() - saved_time
+                                hours_since_save = time_since_save.total_seconds() / 3600
+                                minutes_since_save = time_since_save.total_seconds() / 60
+                                
+                                if hours_since_save > 2:
+                                    print(f"⚠️ Progress is {hours_since_save:.1f} hours old - will re-scrape")
+                                elif hours_since_save > 1:
+                                    print(f"⚠️ Progress is {minutes_since_save:.0f} minutes old - will validate matches")
+                                    saved_matches = resume_data.get('matches_data', [])
+                                    skip_scraping = True  # Try to use saved matches, validate later
+                                else:
+                                    print(f"✅ Progress is {minutes_since_save:.0f} minutes old - will reuse saved matches")
+                                    saved_matches = resume_data.get('matches_data', [])
+                                    skip_scraping = True
+                            except Exception as e:
+                                print(f"⚠️ Could not parse timestamp: {e}")
+                    
                     print(f"{'='*60}\n")
             except Exception as e:
                 print(f"\n⚠️ [WARNING] Could not read progress file: {e}")
@@ -1360,30 +2075,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
             await browser.close()
             return
         
-        # Find matches that start in specified hours by clicking "Next" until we find them
-        print(f"\nSearching for matches starting in {min_time_before_match}+ hours...")
-        target_hours = min_time_before_match
-        now = datetime.now()
-        target_time = now + timedelta(hours=target_hours)
-        target_hour = target_time.hour
-        target_minute = target_time.minute
-        
-        print(f"Current time: {now.hour:02d}:{now.minute:02d}")
-        print(f"Looking for matches around: {target_hour:02d}:{target_minute:02d} or later")
-        
-        # ============================================================================
-        # SMART SCRAPING - Only scrape matches that meet conditions, stop when done
-        # ============================================================================
-        print(f"\n{'='*60}")
-        print("🔍 STARTING SMART SCRAPING")
-        print(f"{'='*60}")
-        print(f"Looking for {num_matches} matches that:")
-        print(f"  1. Start 3.5+ hours from now ({min_time_before_match}+ hours)")
-        print(f"  2. Are {min_gap_hours}+ hours apart from each other")
-        print(f"  3. Have valid URLs captured")
-        print(f"Stopping as soon as we find {num_matches} matches meeting all conditions")
-        print(f"{'='*60}\n")
-        
+        # Define parse_match_time function early (needed for both resume and fresh scraping)
         def parse_match_time(match):
             """Parse match start time and return minutes from midnight"""
             start_time_text = match.get('start_time', '')
@@ -1416,298 +2108,369 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
             
             return None
         
+        # Define min_gap_minutes early (needed for both resume and fresh scraping)
         min_gap_minutes = int(min_gap_hours * 60)
-        filtered_matches = []
-        max_pages = 20
-        current_page = 0
         
-        while len(filtered_matches) < num_matches and current_page < max_pages:
-            current_page += 1
-            print(f"\n📄 Scraping page {current_page}/{max_pages}...")
+        # Check if we can skip scraping and use saved matches
+        filtered_matches = []
+        
+        if skip_scraping and saved_matches and len(saved_matches) >= num_matches:
+            print(f"\n{'='*60}")
+            print("⚡ USING SAVED MATCH DATA (SKIPPING SCRAPING)")
+            print(f"{'='*60}")
+            print(f"Found {len(saved_matches)} saved matches from previous run")
             
-            await close_all_modals(page)
-            await page.wait_for_timeout(500)
+            # Validate saved matches are still valid (not started yet)
+            now = datetime.now()
+            current_minutes = now.hour * 60 + now.minute
+            valid_matches = []
             
-            # Scroll to load content
-            for _ in range(3):
-                await page.evaluate('window.scrollBy(0, 500)')
-                await page.wait_for_timeout(200)
+            for match in saved_matches:
+                match_time = parse_match_time(match)
+                if match_time is not None:
+                    # Check if match hasn't started yet (with 30 min buffer)
+                    if match_time > current_minutes + 30:
+                        valid_matches.append(match)
+                        print(f"  ✓ {match['name']} ({match.get('start_time')}) - still valid")
+                    else:
+                        print(f"  ❌ {match['name']} ({match.get('start_time')}) - already started or too soon")
             
-            match_containers = await page.query_selector_all('div[data-v-206d232b].relative.grid.grid-cols-12')
-            print(f"  Found {len(match_containers)} match containers on page {current_page}")
+            if len(valid_matches) >= num_matches:
+                filtered_matches = valid_matches[:num_matches]
+                print(f"\n✅ Using {len(filtered_matches)} saved matches - no scraping needed!")
+                print(f"{'='*60}\n")
+            else:
+                print(f"\n⚠️ Not enough valid saved matches ({len(valid_matches)} < {num_matches})")
+                print(f"[ACTION] Will scrape for fresh matches...\n")
+                skip_scraping = False
+                saved_matches = None
+        
+        # Only scrape if we don't have valid saved matches
+        if not filtered_matches:
+            # Find matches that start in specified hours by clicking "Next" until we find them
+            print(f"\nSearching for matches starting in {min_time_before_match}+ hours...")
+            target_hours = min_time_before_match
+            now = datetime.now()
+            target_time = now + timedelta(hours=target_hours)
+            target_hour = target_time.hour
+            target_minute = target_time.minute
             
-            # Track which matches we've already checked on this page (by name)
-            processed_match_names = set()
+            print(f"Current time: {now.hour:02d}:{now.minute:02d}")
+            print(f"Looking for matches around: {target_hour:02d}:{target_minute:02d} or later")
             
-            # Debug counters
-            debug_no_teams = 0
-            debug_no_time = 0
-            debug_live = 0
-            debug_too_soon = 0
-            debug_no_odds = 0
-            debug_wrong_odds_count = 0
-            debug_no_gap = 0
+            # ============================================================================
+            # SMART SCRAPING - Only scrape matches that meet conditions, stop when done
+            # ============================================================================
+            print(f"\n{'='*60}")
+            print("🔍 STARTING SMART SCRAPING")
+            print(f"{'='*60}")
+            print(f"Looking for {num_matches} matches that:")
+            print(f"  1. Start 3.5+ hours from now ({min_time_before_match}+ hours)")
+            print(f"  2. Are {min_gap_hours}+ hours apart from each other")
+            print(f"  3. Have valid URLs captured")
+            print(f"Stopping as soon as we find {num_matches} matches meeting all conditions")
+            print(f"{'='*60}\n")
+        
+            min_gap_minutes = int(min_gap_hours * 60)
+            max_pages = 20
+            current_page = 0
             
-            # Keep processing containers until we've checked them all or found enough matches
-            while True:
-                # Process each match container
-                found_match_on_page = False
+            while len(filtered_matches) < num_matches and current_page < max_pages:
+                current_page += 1
+                print(f"\n📄 Scraping page {current_page}/{max_pages}...")
                 
-                for i, container in enumerate(match_containers):
-                    if len(filtered_matches) >= num_matches:
-                        print(f"\n✅ Found {num_matches} matches - stopping scraping early")
+                await close_all_modals(page)
+                await page.wait_for_timeout(500)
+                
+                # Scroll to load content
+                for _ in range(3):
+                    await page.evaluate('window.scrollBy(0, 500)')
+                    await page.wait_for_timeout(200)
+                
+                match_containers = await page.query_selector_all('div[data-v-206d232b].relative.grid.grid-cols-12')
+                print(f"  Found {len(match_containers)} match containers on page {current_page}")
+                
+                # Track which matches we've already checked on this page (by name)
+                processed_match_names = set()
+                
+                # Debug counters
+                debug_no_teams = 0
+                debug_no_time = 0
+                debug_live = 0
+                debug_too_soon = 0
+                debug_no_odds = 0
+                debug_wrong_odds_count = 0
+                debug_no_gap = 0
+                
+                # Keep processing containers until we've checked them all or found enough matches
+                while True:
+                    # Process each match container
+                    found_match_on_page = False
+                    
+                    for i, container in enumerate(match_containers):
+                        if len(filtered_matches) >= num_matches:
+                            print(f"\n✅ Found {num_matches} matches - stopping scraping early")
+                            break
+                        
+                        try:
+                            # Extract team names first to check if already processed
+                            team_elements = await container.query_selector_all('strong.overflow-hidden.text-ellipsis')
+                            if len(team_elements) < 2:
+                                debug_no_teams += 1
+                                continue
+                            
+                            team1 = await team_elements[0].inner_text()
+                            team2 = await team_elements[1].inner_text()
+                            match_name = f"{team1} vs {team2}"
+                            
+                            # Skip if already processed this match
+                            if match_name in processed_match_names:
+                                continue
+                            
+                            # Mark as processed
+                            processed_match_names.add(match_name)
+                            
+                            # Extract start time
+                            start_time_text = None
+                            all_spans = await container.query_selector_all('span')
+                            for span in all_spans:
+                                try:
+                                    span_text = await span.inner_text()
+                                    if span_text and (
+                                        re.match(r'(Today|Tomorrow|Mon|Tue|Wed|Thu|Fri|Sat|Sun).*\d{1,2}:\d{2}', span_text) or
+                                        re.match(r'\d{1,2}\s+\w{3}\s*-?\s*\d{1,2}:\d{2}', span_text)
+                                    ):
+                                        start_time_text = span_text
+                                        break
+                                except:
+                                    continue
+                            
+                            if not start_time_text:
+                                debug_no_time += 1
+                                continue
+                            
+                            # Skip live matches
+                            if 'Live' in start_time_text or 'live' in start_time_text.lower():
+                                debug_live += 1
+                                continue
+                            
+                            # Check if match meets basic time requirement (3.5+ hours or future date)
+                            is_valid_time = False
+                            
+                            # Accept future dates
+                            if re.search(r'\d{1,2}\s+\w{3}', start_time_text):
+                                is_valid_time = True
+                            # Accept tomorrow matches
+                            elif 'Tomorrow' in start_time_text:
+                                is_valid_time = True
+                            # For today's matches, check if they meet minimum time requirement
+                            elif 'Today' in start_time_text:
+                                time_match = re.search(r'(\d{1,2}):(\d{2})', start_time_text)
+                                if time_match:
+                                    start_hour = int(time_match.group(1))
+                                    start_minute = int(time_match.group(2))
+                                    time_until_match = (start_hour - now.hour) * 60 + (start_minute - now.minute)
+                                    
+                                    min_minutes = int(min_time_before_match * 60)
+                                    if time_until_match >= min_minutes:
+                                        is_valid_time = True
+                            
+                            if not is_valid_time:
+                                debug_too_soon += 1
+                                continue
+                            
+                            # Extract odds
+                            odds = []
+                            try:
+                                price_divs = await container.query_selector_all('div[price]')
+                                if len(price_divs) >= 3:
+                                    for j in range(3):
+                                        btn = price_divs[j]
+                                        try:
+                                            odd_elem = await btn.query_selector('span')
+                                            if odd_elem:
+                                                odd_text = await odd_elem.inner_text()
+                                                if odd_text and odd_text.replace('.', '').replace(',', '').isdigit():
+                                                    odds.append(float(odd_text.replace(',', '.')))
+                                        except:
+                                            continue
+                                else:
+                                    debug_no_odds += 1
+                            except:
+                                debug_no_odds += 1
+                            
+                            # CRITICAL: Only accept matches with exactly 3 odds (1X2 market)
+                            # This filters for 1X2 matches without checking text headers
+                            if len(odds) != 3:
+                                debug_wrong_odds_count += 1
+                                continue  # Skip matches without 1X2 market
+                            
+                            # Create match object
+                            match = {
+                                'name': match_name,
+                                'team1': team1,
+                                'team2': team2,
+                                'odds': odds[:3],
+                                'start_time': start_time_text,
+                                'url': None
+                            }
+                            
+                            # Check if this match is at least 2 hours apart from all already selected matches
+                            current_time = parse_match_time(match)
+                            if current_time is None:
+                                continue
+                            
+                            is_far_enough = True
+                            
+                            for selected_match in filtered_matches:
+                                selected_time = parse_match_time(selected_match)
+                                if selected_time is not None:
+                                    time_diff = abs(current_time - selected_time)
+                                    if time_diff < min_gap_minutes:
+                                        is_far_enough = False
+                                        break
+                            
+                            if not is_far_enough:
+                                debug_no_gap += 1
+                                continue
+                            
+                            # Try to capture URL for this match - extract from href attribute instead of navigating
+                            try:
+                                # Find the <a> element that contains the match URL
+                                link_element = await container.query_selector('a[href*="/event/soccer/"]')
+                                if link_element:
+                                    try:
+                                        # Extract href attribute directly - no navigation needed!
+                                        relative_url = await link_element.get_attribute('href')
+                                        if relative_url:
+                                            # Convert relative URL to absolute
+                                            if relative_url.startswith('/'):
+                                                match_url = f"https://new.betway.co.za{relative_url}"
+                                            else:
+                                                match_url = relative_url
+                                        else:
+                                            match_url = None
+                                    except Exception as href_error:
+                                        print(f"  ⚠️ Failed to extract href: {href_error}")
+                                        match_url = None
+                                    
+                                    # No need for page.go_back() or close_all_modals() anymore!
+                                    match['url'] = match_url
+                                    filtered_matches.append(match)
+                                    print(f"  ✓ Match {len(filtered_matches)}/{num_matches}: '{match_name}' ({start_time_text}) [URL cached]")
+                                    
+                                    # No need to re-query containers since we didn't navigate away!
+                                    found_match_on_page = True
+                                    
+                                    if len(filtered_matches) >= num_matches:
+                                        break  # We have enough matches
+                                        
+                                else:
+                                    print(f"  ⚠️ Could not find link element for '{match_name}'")
+                            except Exception as e:
+                                print(f"  ⚠️ Could not capture URL for '{match_name}': {e}")
+                                continue
+                            
+                        except Exception as e:
+                            continue
+                    
+                    # If we didn't find a match, we've processed all containers
+                    if not found_match_on_page:
                         break
                     
+                    # If we have enough matches, stop
+                    if len(filtered_matches) >= num_matches:
+                        break
+                
+                # Print debug info for this page
+                if len(filtered_matches) < num_matches:
+                    print(f"  📊 Debug - why matches were skipped on page {current_page}:")
+                    if debug_no_teams > 0:
+                        print(f"    ❌ {debug_no_teams} - Missing team names")
+                    if debug_no_time > 0:
+                        print(f"    ❌ {debug_no_time} - No start time found")
+                    if debug_live > 0:
+                        print(f"    ❌ {debug_live} - Live matches (excluded)")
+                    if debug_too_soon > 0:
+                        print(f"    ❌ {debug_too_soon} - Starts too soon (<3.5 hours)")
+                    if debug_no_odds > 0:
+                        print(f"    ❌ {debug_no_odds} - No odds available")
+                    if debug_wrong_odds_count > 0:
+                        print(f"    ❌ {debug_wrong_odds_count} - Not 1X2 market (odds ≠ 3)")
+                    if debug_no_gap > 0:
+                        print(f"    ❌ {debug_no_gap} - Too close to other selected matches (<2h gap)")
+                
+                # Early termination check
+                if len(filtered_matches) >= num_matches:
+                    break
+                
+                # Click Next button if we need more matches and haven't reached max pages
+                if len(filtered_matches) < num_matches and current_page < max_pages:
+                    print(f"  Need {num_matches - len(filtered_matches)} more match(es) - moving to page {current_page + 1}...")
                     try:
-                        # Extract team names first to check if already processed
-                        team_elements = await container.query_selector_all('strong.overflow-hidden.text-ellipsis')
-                        if len(team_elements) < 2:
-                            debug_no_teams += 1
-                            continue
+                        # Try multiple Next button selectors
+                        next_button = None
+                        next_selectors = [
+                            'button[aria-label="Go to next page"]',
+                            'button.p-ripple.p-element.p-paginator-next',
+                            'button:has-text("Next")',
+                            'button[class*="next"]'
+                        ]
                         
-                        team1 = await team_elements[0].inner_text()
-                        team2 = await team_elements[1].inner_text()
-                        match_name = f"{team1} vs {team2}"
-                        
-                        # Skip if already processed this match
-                        if match_name in processed_match_names:
-                            continue
-                        
-                        # Mark as processed
-                        processed_match_names.add(match_name)
-                        
-                        # Extract start time
-                        start_time_text = None
-                        all_spans = await container.query_selector_all('span')
-                        for span in all_spans:
+                        for selector in next_selectors:
                             try:
-                                span_text = await span.inner_text()
-                                if span_text and (
-                                    re.match(r'(Today|Tomorrow|Mon|Tue|Wed|Thu|Fri|Sat|Sun).*\d{1,2}:\d{2}', span_text) or
-                                    re.match(r'\d{1,2}\s+\w{3}\s*-?\s*\d{1,2}:\d{2}', span_text)
-                                ):
-                                    start_time_text = span_text
-                                    break
+                                btn = await page.query_selector(selector)
+                                if btn:
+                                    is_disabled = await btn.get_attribute('disabled')
+                                    if not is_disabled:
+                                        next_button = btn
+                                        break
                             except:
                                 continue
                         
-                        if not start_time_text:
-                            debug_no_time += 1
-                            continue
-                        
-                        # Skip live matches
-                        if 'Live' in start_time_text or 'live' in start_time_text.lower():
-                            debug_live += 1
-                            continue
-                        
-                        # Check if match meets basic time requirement (3.5+ hours or future date)
-                        is_valid_time = False
-                        
-                        # Accept future dates
-                        if re.search(r'\d{1,2}\s+\w{3}', start_time_text):
-                            is_valid_time = True
-                        # Accept tomorrow matches
-                        elif 'Tomorrow' in start_time_text:
-                            is_valid_time = True
-                        # For today's matches, check if they meet minimum time requirement
-                        elif 'Today' in start_time_text:
-                            time_match = re.search(r'(\d{1,2}):(\d{2})', start_time_text)
-                            if time_match:
-                                start_hour = int(time_match.group(1))
-                                start_minute = int(time_match.group(2))
-                                time_until_match = (start_hour - now.hour) * 60 + (start_minute - now.minute)
-                                
-                                min_minutes = int(min_time_before_match * 60)
-                                if time_until_match >= min_minutes:
-                                    is_valid_time = True
-                        
-                        if not is_valid_time:
-                            debug_too_soon += 1
-                            continue
-                        
-                        # Extract odds
-                        odds = []
-                        try:
-                            price_divs = await container.query_selector_all('div[price]')
-                            if len(price_divs) >= 3:
-                                for j in range(3):
-                                    btn = price_divs[j]
-                                    try:
-                                        odd_elem = await btn.query_selector('span')
-                                        if odd_elem:
-                                            odd_text = await odd_elem.inner_text()
-                                            if odd_text and odd_text.replace('.', '').replace(',', '').isdigit():
-                                                odds.append(float(odd_text.replace(',', '.')))
-                                    except:
-                                        continue
-                            else:
-                                debug_no_odds += 1
-                        except:
-                            debug_no_odds += 1
-                            pass
-                        
-                        # CRITICAL: Only accept matches with exactly 3 odds (1X2 market)
-                        # This filters for 1X2 matches without checking text headers
-                        if len(odds) != 3:
-                            debug_wrong_odds_count += 1
-                            continue  # Skip matches without 1X2 market
-                        
-                        # Create match object
-                        match = {
-                            'name': match_name,
-                            'team1': team1,
-                            'team2': team2,
-                            'odds': odds[:3],
-                            'start_time': start_time_text,
-                            'url': None
-                        }
-                        
-                        # Check if this match is at least 2 hours apart from all already selected matches
-                        current_time = parse_match_time(match)
-                        if current_time is None:
-                            continue
-                        
-                        is_far_enough = True
-                        
-                        for selected_match in filtered_matches:
-                            selected_time = parse_match_time(selected_match)
-                            if selected_time is not None:
-                                time_diff = abs(current_time - selected_time)
-                                if time_diff < min_gap_minutes:
-                                    is_far_enough = False
-                                    break
-                        
-                        if not is_far_enough:
-                            debug_no_gap += 1
-                            continue
-                        
-                        # Try to capture URL for this match - extract from href attribute instead of navigating
-                        try:
-                            # Find the <a> element that contains the match URL
-                            link_element = await container.query_selector('a[href*="/event/soccer/"]')
-                            if link_element:
-                                try:
-                                    # Extract href attribute directly - no navigation needed!
-                                    relative_url = await link_element.get_attribute('href')
-                                    if relative_url:
-                                        # Convert relative URL to absolute
-                                        if relative_url.startswith('/'):
-                                            match_url = f"https://new.betway.co.za{relative_url}"
-                                        else:
-                                            match_url = relative_url
-                                    else:
-                                        match_url = None
-                                except Exception as href_error:
-                                    print(f"  ⚠️ Failed to extract href: {href_error}")
-                                    match_url = None
-                                
-                                # No need for page.go_back() or close_all_modals() anymore!
-                                match['url'] = match_url
-                                filtered_matches.append(match)
-                                print(f"  ✓ Match {len(filtered_matches)}/{num_matches}: '{match_name}' ({start_time_text}) [URL cached]")
-                                
-                                # No need to re-query containers since we didn't navigate away!
-                                found_match_on_page = True
-                                
-                                if len(filtered_matches) >= num_matches:
-                                    break  # We have enough matches
-                                    
-                            else:
-                                print(f"  ⚠️ Could not find link element for '{match_name}'")
-                        except Exception as e:
-                            print(f"  ⚠️ Could not capture URL for '{match_name}': {e}")
-                            continue
-                        
+                        if next_button:
+                            print(f"  Clicking 'Next' to load page {current_page + 1}...")
+                            await next_button.click()
+                            await page.wait_for_timeout(1500)
+                        else:
+                            # No next button found or all disabled - we've reached the end
+                            print(f"  No 'Next' button available - reached last page")
+                            break  # Exit outer while loop - no more pages
+                            
                     except Exception as e:
-                        continue
-                
-                # If we didn't find a match, we've processed all containers
-                if not found_match_on_page:
-                    break
-                
-                # If we have enough matches, stop
-                if len(filtered_matches) >= num_matches:
-                    break
+                        print(f"  ⚠️ Error clicking Next button: {e}")
+                        # Don't break - try to continue anyway by reloading or continuing
+                        print(f"  Attempting to continue to page {current_page + 1} anyway...")
+                        # The outer loop will continue and try to get containers on what might be the same page
+        
+            print(f"\n{'='*60}")
+            print(f"✅ SMART SCRAPING COMPLETE")
+            print(f"{'='*60}")
+            print(f"Found {len(filtered_matches)}/{num_matches} matches meeting all conditions")
+            print(f"Scraped {current_page} pages")
+            print(f"{'='*60}\n")
             
-            # Print debug info for this page
             if len(filtered_matches) < num_matches:
-                print(f"  📊 Debug - why matches were skipped on page {current_page}:")
-                if debug_no_teams > 0:
-                    print(f"    ❌ {debug_no_teams} - Missing team names")
-                if debug_no_time > 0:
-                    print(f"    ❌ {debug_no_time} - No start time found")
-                if debug_live > 0:
-                    print(f"    ❌ {debug_live} - Live matches (excluded)")
-                if debug_too_soon > 0:
-                    print(f"    ❌ {debug_too_soon} - Starts too soon (<3.5 hours)")
-                if debug_no_odds > 0:
-                    print(f"    ❌ {debug_no_odds} - No odds available")
-                if debug_wrong_odds_count > 0:
-                    print(f"    ❌ {debug_wrong_odds_count} - Not 1X2 market (odds ≠ 3)")
-                if debug_no_gap > 0:
-                    print(f"    ❌ {debug_no_gap} - Too close to other selected matches (<2h gap)")
-            
-            # Early termination check
-            if len(filtered_matches) >= num_matches:
-                break
-            
-            # Click Next button if we need more matches and haven't reached max pages
-            if len(filtered_matches) < num_matches and current_page < max_pages:
-                print(f"  Need {num_matches - len(filtered_matches)} more match(es) - moving to page {current_page + 1}...")
-                try:
-                    # Try multiple Next button selectors
-                    next_button = None
-                    next_selectors = [
-                        'button[aria-label="Go to next page"]',
-                        'button.p-ripple.p-element.p-paginator-next',
-                        'button:has-text("Next")',
-                        'button[class*="next"]'
-                    ]
-                    
-                    for selector in next_selectors:
-                        try:
-                            btn = await page.query_selector(selector)
-                            if btn:
-                                is_disabled = await btn.get_attribute('disabled')
-                                if not is_disabled:
-                                    next_button = btn
-                                    break
-                        except:
-                            continue
-                    
-                    if next_button:
-                        print(f"  Clicking 'Next' to load page {current_page + 1}...")
-                        await next_button.click()
-                        await page.wait_for_timeout(1500)
-                    else:
-                        # No next button found or all disabled - we've reached the end
-                        print(f"  No 'Next' button available - reached last page")
-                        break  # Exit outer while loop - no more pages
-                        
-                except Exception as e:
-                    print(f"  ⚠️ Error clicking Next button: {e}")
-                    # Don't break - try to continue anyway by reloading or continuing
-                    print(f"  Attempting to continue to page {current_page + 1} anyway...")
-                    # The outer loop will continue and try to get containers on what might be the same page
-        
-        print(f"\n{'='*60}")
-        print(f"✅ SMART SCRAPING COMPLETE")
-        print(f"{'='*60}")
-        print(f"Found {len(filtered_matches)}/{num_matches} matches meeting all conditions")
-        print(f"Scraped {current_page} pages")
-        print(f"{'='*60}\n")
-        
-        if len(filtered_matches) < num_matches:
-            print(f"\n[ERROR] Could not find {num_matches} matches with {min_gap_hours}+ hour gaps")
-            print(f"Scraped {current_page} pages, found {len(filtered_matches)} matches meeting conditions")
-            await browser.close()
-            return
+                print(f"\n[ERROR] Could not find {num_matches} matches with {min_gap_hours}+ hour gaps")
+                print(f"Scraped {current_page} pages, found {len(filtered_matches)} matches meeting conditions")
+                await browser.close()
+                return
         
         # Use the filtered matches
         matches = filtered_matches[:num_matches]
-        print(f"\n[OK] Final selection - {len(matches)} matches (each {min_gap_hours}+ hours apart):")
+        print(f"\n{'='*60}")
+        print(f"📋 SELECTED MATCHES ({len(matches)} matches)")
+        print(f"{'='*60}")
         for i, m in enumerate(matches, 1):
-            print(f"  {i}. {m['name']} - {m.get('start_time', 'Unknown time')} - Odds: {m.get('odds', [])}")
+            start_time = m.get('start_time', 'Unknown time')
+            odds = m.get('odds', [])
+            odds_str = f"1:{odds[0]:.2f} X:{odds[1]:.2f} 2:{odds[2]:.2f}" if len(odds) >= 3 else str(odds)
+            print(f"  {i}. {m['name']}")
+            print(f"     ⏰ Start: {start_time}")
+            print(f"     📊 Odds: {odds_str}")
+        print(f"{'='*60}")
+        print(f"All matches are {min_gap_hours}+ hours apart from each other")
+        print(f"{'='*60}\n")
         
         # CRITICAL: Validate all matches have cached URLs before proceeding
         print(f"\n{'='*60}")
@@ -1717,10 +2480,11 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
         missing_urls = []
         for i, match in enumerate(matches, 1):
             match_url = match.get('url')
+            start_time = match.get('start_time', 'Unknown')
             if match_url:
-                print(f"  ✓ Match {i}: {match['name']} - URL cached")
+                print(f"  ✓ Match {i}: {match['name']} ({start_time}) - URL cached")
             else:
-                print(f"  ❌ Match {i}: {match['name']} - NO URL!")
+                print(f"  ❌ Match {i}: {match['name']} ({start_time}) - NO URL!")
                 missing_urls.append(match['name'])
         
         if missing_urls:
@@ -1812,8 +2576,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
         
         first_match = matches[0]
         if first_match.get('start_time'):
-            print(f"\nFirst match: {first_match['name']}")
-            print(f"Start time: {first_match['start_time']}")
+            print(f"\nFirst match: {first_match['name']} | ⏰ {first_match['start_time']}")
             print(f"\n[OK] Time validated - safe to proceed!")
         
         print(f"{'='*60}\n")
@@ -1871,9 +2634,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
         
         for match_idx, match in enumerate(matches[:num_matches], 1):
             match_url = match.get('url')
+            start_time = match.get('start_time', 'Unknown time')
             if match_url and match_url not in outcome_button_cache:
                 try:
-                    print(f"Match {match_idx}/{num_matches}: {match['name']}")
+                    print(f"Match {match_idx}/{num_matches}: {match['name']} | ⏰ {start_time}")
                     print(f"  Navigating to: {match_url}")
                     await page.goto(match_url, wait_until='domcontentloaded', timeout=15000)
                     await page.wait_for_timeout(1500)
@@ -1933,9 +2697,30 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
         # Check if resuming with saved progress
         if resume_data:
             saved_fingerprint = resume_data.get('match_fingerprint', [])
+            saved_timestamp = resume_data.get('timestamp', '')
+            
+            # Check if progress is too old (more than 2 hours)
+            is_expired = False
+            if saved_timestamp:
+                try:
+                    saved_time = datetime.fromisoformat(saved_timestamp)
+                    time_since_save = datetime.now() - saved_time
+                    hours_since_save = time_since_save.total_seconds() / 3600
+                    
+                    if hours_since_save > 2:
+                        print(f"\n⚠️ [WARNING] Progress file is {hours_since_save:.1f} hours old!")
+                        print(f"[INFO] Saved at: {saved_timestamp}")
+                        print(f"[ACTION] Progress expired - starting fresh...\n")
+                        is_expired = True
+                except Exception as e:
+                    print(f"\n⚠️ [WARNING] Could not parse timestamp: {e}")
+                    is_expired = True
             
             # Validate matches haven't changed
-            if saved_fingerprint != current_match_fingerprint:
+            if is_expired:
+                os.remove(progress_file)
+                resume_data = None
+            elif saved_fingerprint != current_match_fingerprint:
                 print(f"\n⚠️ [WARNING] Matches have changed since last run!")
                 print(f"[INFO] Saved matches: {saved_fingerprint}")
                 print(f"[INFO] Current matches: {current_match_fingerprint}")
@@ -1945,10 +2730,21 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
             else:
                 start_index = resume_data.get('last_completed_bet', 0)
                 successful = resume_data.get('successful', 0)
-                failed = resume_data.get('failed', 0)
+                failed = 0  # Reset failed count since we're retrying
+                
+                # Calculate time since last save
+                time_info = ""
+                if saved_timestamp:
+                    try:
+                        saved_time = datetime.fromisoformat(saved_timestamp)
+                        minutes_ago = (datetime.now() - saved_time).total_seconds() / 60
+                        time_info = f" ({minutes_ago:.0f} minutes ago)"
+                    except:
+                        pass
+                
                 print(f"\n✅ [RESUME] Matches validated - same as previous run")
-                print(f"[RESUME] Continuing from bet {start_index + 1}/{len(bet_slips)}")
-                print(f"[PROGRESS] Previous: {successful} successful, {failed} failed\n")
+                print(f"[RESUME] Resuming from bet {start_index + 1}/{len(bet_slips)} (retrying failed bet)")
+                print(f"[PROGRESS] Previously successful: {successful}{time_info}\n")
         
         for i, bet_slip in enumerate(bet_slips):
             # Skip already completed bets
@@ -1958,6 +2754,24 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
             print(f"\n{'='*60}")
             print(f"BET {i+1}/{len(bet_slips)}")
             print(f"{'='*60}")
+            
+            # Check if still logged in before each bet
+            is_logged_in = await check_and_relogin(page, browser)
+            if not is_logged_in:
+                print(f"\n❌ [FATAL] Could not verify/restore login - stopping bet placement")
+                print(f"[INFO] Completed {successful} bets before login failure")
+                # Save progress before stopping
+                with open(progress_file, 'w') as f:
+                    json.dump({
+                        'last_completed_bet': i,
+                        'last_successful_bet': i - 1 if i > 0 else 0,
+                        'successful': successful,
+                        'failed': failed,
+                        'match_fingerprint': current_match_fingerprint,
+                        'timestamp': datetime.now().isoformat(),
+                        'matches_data': matches
+                    }, f)
+                break
             
             try:
                 # Try to place bet with retry on network errors
@@ -1974,18 +2788,20 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
                     print("[ERROR] Marking bet as failed (no browser restart)")
                     success = False
                 
-                if success:
+                if success == True:
                     successful += 1
                     print(f"\n[SUCCESS] Bet slip {bet_slip['slip_number']} placed!")
                     
-                    # Save progress
+                    # Save progress - track last SUCCESSFUL bet index
                     with open(progress_file, 'w') as f:
                         json.dump({
-                            'last_completed_bet': i + 1,
+                            'last_completed_bet': i + 1,  # Next bet to attempt
+                            'last_successful_bet': i,  # Last successful bet index
                             'successful': successful,
                             'failed': failed,
                             'match_fingerprint': current_match_fingerprint,
-                            'timestamp': datetime.now().isoformat()
+                            'timestamp': datetime.now().isoformat(),
+                            'matches_data': matches  # Save match data for resume
                         }, f)
                     
                     # Wait between bets
@@ -1996,10 +2812,229 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
                         if not wait_success:
                             print("\n[WARNING] Wait interrupted - continuing anyway...")
                 
+                elif success == "RETRY":
+                    # Click failed but may succeed on retry - don't count as failed yet
+                    print(f"\n⚠️ [RETRY NEEDED] Bet slip {bet_slip['slip_number']} click failed - will retry...")
+                    
+                    # Wait a bit before retrying
+                    print("  Waiting 10 seconds before retry...")
+                    await page.wait_for_timeout(10000)
+                    
+                    # Retry the same bet
+                    print(f"\n🔄 RETRYING BET {bet_slip['slip_number']}/{len(bet_slips)}...")
+                    retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
+                    
+                    if retry_success == True:
+                        successful += 1
+                        print(f"\n[SUCCESS] Retry bet slip {bet_slip['slip_number']} placed!")
+                        
+                        # Save progress
+                        with open(progress_file, 'w') as f:
+                            json.dump({
+                                'last_completed_bet': i + 1,
+                                'last_successful_bet': i,
+                                'successful': successful,
+                                'failed': failed,
+                                'match_fingerprint': current_match_fingerprint,
+                                'timestamp': datetime.now().isoformat(),
+                                'matches_data': matches  # Save match data for resume
+                            }, f)
+                        
+                        # Wait between bets
+                        if i < len(bet_slips) - 1:
+                            await wait_between_bets(page, seconds=5, add_random=True)
+                    else:
+                        # Retry also failed - now count as failed
+                        failed += 1
+                        failed_bets.append(bet_slip)
+                        print(f"\n❌ [FAILED] Retry bet slip {bet_slip['slip_number']} also failed!")
+                        
+                        # Save progress at failed bet (so resume will retry THIS bet)
+                        with open(progress_file, 'w') as f:
+                            json.dump({
+                                'last_completed_bet': i,  # Resume FROM this bet
+                                'last_successful_bet': i - 1 if i > 0 else -1,
+                                'successful': successful,
+                                'failed': failed,
+                                'match_fingerprint': current_match_fingerprint,
+                                'timestamp': datetime.now().isoformat(),
+                                'matches_data': matches  # Save match data for resume
+                            }, f)
+                        
+                        print(f"\n{'='*60}")
+                        print(f"⛔ TERMINATING - BET FAILED AFTER RETRY")
+                        print(f"{'='*60}")
+                        print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
+                        print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
+                        print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
+                        print(f"{'='*60}\n")
+                        
+                        try:
+                            await page.close()
+                            await browser.close()
+                        except:
+                            pass
+                        
+                        import sys
+                        sys.exit(1)
+                
+                elif success == "RELOGIN":
+                    # Session expired during bet - need to re-login and retry
+                    print(f"\n🔄 [RE-LOGIN REQUIRED] Session expired during bet {bet_slip['slip_number']}")
+                    print("  Attempting to re-authenticate...")
+                    
+                    # Attempt re-login
+                    relogin_success = await check_and_relogin(page, browser)
+                    
+                    if relogin_success:
+                        print("  ✅ Re-login successful! Verifying login state...")
+                        
+                        # CRITICAL: Verify login was actually successful by checking for balance
+                        await page.wait_for_timeout(2000)
+                        balance_verified = False
+                        for verify_attempt in range(3):
+                            try:
+                                balance_elem = await page.query_selector('strong:has-text("Balance")')
+                                if balance_elem and await balance_elem.is_visible():
+                                    parent = await balance_elem.evaluate_handle('el => el.closest("div")')
+                                    balance_text = await parent.inner_text()
+                                    balance_clean = balance_text.replace('\n', ' ').strip()
+                                    print(f"  ✓ Login verified: {balance_clean}")
+                                    balance_verified = True
+                                    break
+                            except:
+                                pass
+                            
+                            if verify_attempt < 2:
+                                print(f"  ⏳ Verifying login... (attempt {verify_attempt + 1}/3)")
+                                await page.wait_for_timeout(1500)
+                        
+                        if not balance_verified:
+                            print("  ⚠️ Could not verify login, but continuing anyway...")
+                        
+                        # Navigate to clear betslip completely before retrying
+                        print("  Clearing betslip before retry...")
+                        try:
+                            await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                            await page.wait_for_timeout(3000)  # Increased wait time
+                            await close_all_modals(page)
+                            
+                            # Verify betslip is empty by scrolling to it
+                            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                            await page.wait_for_timeout(1000)
+                            print("  ✓ Betslip cleared and page ready")
+                        except Exception as nav_err:
+                            print(f"  ⚠️ Navigation warning: {nav_err}")
+                        
+                        await page.wait_for_timeout(1000)
+                        
+                        # Retry the bet after re-login
+                        retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
+                        
+                        if retry_success == True:
+                            successful += 1
+                            print(f"\n[SUCCESS] Bet slip {bet_slip['slip_number']} placed after re-login!")
+                            
+                            # Save progress
+                            with open(progress_file, 'w') as f:
+                                json.dump({
+                                    'last_completed_bet': i + 1,
+                                    'last_successful_bet': i,
+                                    'successful': successful,
+                                    'failed': failed,
+                                    'match_fingerprint': current_match_fingerprint,
+                                    'timestamp': datetime.now().isoformat(),
+                                    'matches_data': matches
+                                }, f)
+                            
+                            # Wait between bets
+                            if i < len(bet_slips) - 1:
+                                await wait_between_bets(page, seconds=5, add_random=True)
+                        else:
+                            # Retry after re-login also failed
+                            failed += 1
+                            failed_bets.append(bet_slip)
+                            print(f"\n❌ [FAILED] Bet slip {bet_slip['slip_number']} failed even after re-login!")
+                            
+                            # Save progress and terminate
+                            with open(progress_file, 'w') as f:
+                                json.dump({
+                                    'last_completed_bet': i,
+                                    'last_successful_bet': i - 1 if i > 0 else -1,
+                                    'successful': successful,
+                                    'failed': failed,
+                                    'match_fingerprint': current_match_fingerprint,
+                                    'timestamp': datetime.now().isoformat(),
+                                    'matches_data': matches
+                                }, f)
+                            
+                            print(f"\n{'='*60}")
+                            print(f"⛔ TERMINATING - BET FAILED AFTER RE-LOGIN")
+                            print(f"{'='*60}")
+                            print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
+                            print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
+                            print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
+                            print(f"{'='*60}\n")
+                            
+                            try:
+                                await page.close()
+                                await browser.close()
+                            except:
+                                pass
+                            
+                            import sys
+                            sys.exit(1)
+                    else:
+                        # Re-login failed - cannot continue
+                        failed += 1
+                        failed_bets.append(bet_slip)
+                        print(f"\n❌ [FATAL] Re-login failed! Cannot continue betting.")
+                        
+                        # Save progress and terminate
+                        with open(progress_file, 'w') as f:
+                            json.dump({
+                                'last_completed_bet': i,
+                                'last_successful_bet': i - 1 if i > 0 else -1,
+                                'successful': successful,
+                                'failed': failed,
+                                'match_fingerprint': current_match_fingerprint,
+                                'timestamp': datetime.now().isoformat(),
+                                'matches_data': matches
+                            }, f)
+                        
+                        print(f"\n{'='*60}")
+                        print(f"⛔ TERMINATING - RE-LOGIN FAILED")
+                        print(f"{'='*60}")
+                        print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
+                        print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
+                        print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
+                        print(f"{'='*60}\n")
+                        
+                        try:
+                            await page.close()
+                            await browser.close()
+                        except:
+                            pass
+                        
+                        import sys
+                        sys.exit(1)
+                
                 else:
                     failed += 1
                     failed_bets.append(bet_slip)  # Store failed bet for retry
                     print(f"\n❌ [FAILED] Bet slip {bet_slip['slip_number']} failed!")
+                    
+                    # Save progress at failed bet (so resume will retry THIS bet)
+                    with open(progress_file, 'w') as f:
+                        json.dump({
+                            'last_completed_bet': i,  # Resume FROM this bet, not next
+                            'last_successful_bet': i - 1 if i > 0 else -1,
+                            'successful': successful,
+                            'failed': failed,
+                            'match_fingerprint': current_match_fingerprint,
+                            'timestamp': datetime.now().isoformat(),
+                            'matches_data': matches  # Save match data for resume
+                        }, f)
                     
                     # CRITICAL: Terminate ALL bets if any bet fails
                     print(f"\n{'='*60}")
@@ -2007,6 +3042,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
                     print(f"{'='*60}")
                     print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
                     print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
+                    print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
                     print(f"{'='*60}\n")
                     
                     # Close browser and exit application completely
@@ -2016,19 +3052,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
                     except:
                         pass
                     
-                    print("🛑 APPLICATION STOPPED - Bet failed. Please review and fix the issue.\n")
                     import sys
                     sys.exit(1)
-                    
-                    # Save progress even for failed bets
-                    with open(progress_file, 'w') as f:
-                        json.dump({
-                            'last_completed_bet': i + 1,
-                            'successful': successful,
-                            'failed': failed,
-                            'match_fingerprint': current_match_fingerprint,
-                            'timestamp': datetime.now().isoformat()
-                        }, f)
                 
                 await asyncio.sleep(2)
                 
@@ -2037,36 +3062,37 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
                 failed_bets.append(bet_slip)  # Store failed bet for retry
                 print(f"\n[ERROR] Exception on slip {bet_slip['slip_number']}: {e}")
                 
-                # CRITICAL: Terminate ALL bets after first failure
-                if failed == 1:
-                    print(f"\n{'='*60}")
-                    print(f"⛔ TERMINATING ALL BETS - EXCEPTION ON FIRST BET")
-                    print(f"{'='*60}")
-                    print(f"Error: {str(e)}")
-                    print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
-                    print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
-                    print(f"{'='*60}\n")
-                    
-                    # Close browser and exit application completely
-                    try:
-                        await page.close()
-                        await browser.close()
-                    except:
-                        pass
-                    
-                    print("🛑 APPLICATION STOPPED - First bet threw exception. Please review and fix the issue.\n")
-                    import sys
-                    sys.exit(1)
-                
-                # Save progress
+                # Save progress at failed bet (so resume will retry THIS bet)
                 with open(progress_file, 'w') as f:
                     json.dump({
-                        'last_completed_bet': i + 1,
+                        'last_completed_bet': i,  # Resume FROM this bet, not next
+                        'last_successful_bet': i - 1 if i > 0 else -1,
                         'successful': successful,
                         'failed': failed,
                         'match_fingerprint': current_match_fingerprint,
-                        'timestamp': datetime.now().isoformat()
+                        'timestamp': datetime.now().isoformat(),
+                        'matches_data': matches  # Save match data for resume
                     }, f)
+                
+                # CRITICAL: Terminate ALL bets after exception
+                print(f"\n{'='*60}")
+                print(f"⛔ TERMINATING ALL BETS - EXCEPTION OCCURRED")
+                print(f"{'='*60}")
+                print(f"Error: {str(e)}")
+                print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
+                print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
+                print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
+                print(f"{'='*60}\n")
+                
+                # Close browser and exit application completely
+                try:
+                    await page.close()
+                    await browser.close()
+                except:
+                    pass
+                
+                import sys
+                sys.exit(1)
         
         # Retry failed bets
         if len(failed_bets) > 0:
@@ -2160,7 +3186,29 @@ def main():
         try:
             num_matches = int(sys.argv[1])
             amount_per_slip = float(sys.argv[2])
+            
+            # Validate num_matches
+            if num_matches < 1:
+                print("[ERROR] Number of matches must be at least 1")
+                print("Usage: python main.py <num_matches> <amount_per_slip>")
+                print("Example: python main.py 1 1.0")
+                return
+            
+            # Validate amount
+            if amount_per_slip <= 0:
+                print("[ERROR] Amount per slip must be greater than 0")
+                print("Usage: python main.py <num_matches> <amount_per_slip>")
+                print("Example: python main.py 2 1.0")
+                return
+            
+            # Warn about large number of matches
+            total_bets = 3 ** num_matches
+            if num_matches > 5:
+                print(f"[WARNING] {num_matches} matches will generate {total_bets:,} bets!")
+                print(f"[WARNING] This may take a very long time and cost R{total_bets * amount_per_slip:,.2f}")
+            
             print(f"[CLI MODE] Using arguments: {num_matches} matches, R{amount_per_slip} per slip")
+            print(f"[CLI MODE] Total bets: {total_bets}, Total cost: R{total_bets * amount_per_slip:.2f}")
         except ValueError:
             print("Usage: python main.py <num_matches> <amount_per_slip>")
             print("Example (test): python main.py 1 1.0")
