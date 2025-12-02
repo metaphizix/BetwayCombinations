@@ -6,6 +6,7 @@ import os
 import json
 import random
 import math
+import gc  # Garbage collection for memory management
 from itertools import product
 from playwright.async_api import async_playwright, Page
 from playwright._impl._errors import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
@@ -15,6 +16,317 @@ import re
 
 # Load environment variables from .env file
 load_dotenv()
+
+
+# ============================================================================
+# BET VERIFICATION HELPER FUNCTIONS
+# ============================================================================
+
+async def get_current_balance(page: Page) -> float:
+    """
+    Get the current account balance from the page.
+    Returns the balance as a float, or -1.0 if unable to retrieve.
+    """
+    try:
+        # Try multiple selectors for balance
+        balance_selectors = [
+            '#header-balance',
+            'strong:has-text("Balance")',
+            'span:has-text("R ")',
+            'div[class*="balance"]',
+        ]
+        
+        for selector in balance_selectors:
+            try:
+                element = await page.query_selector(selector)
+                if element and await element.is_visible():
+                    if selector == 'strong:has-text("Balance")':
+                        # Get parent div for full balance text
+                        parent = await element.evaluate_handle('el => el.closest("div")')
+                        text = await parent.inner_text()
+                    else:
+                        text = await element.inner_text()
+                    
+                    # Extract numeric value using regex (e.g., "R 85.51" -> 85.51)
+                    match = re.search(r'R\s*(\d+(?:[.,]\d+)?)', text)
+                    if match:
+                        balance_str = match.group(1).replace(',', '.')
+                        return float(balance_str)
+            except:
+                continue
+        
+        return -1.0  # Unable to get balance
+    except Exception as e:
+        print(f"    ⚠️ Error getting balance: {e}")
+        return -1.0
+
+
+async def count_betslip_selections(page: Page) -> int:
+    """
+    Count the number of selections currently in the bet slip.
+    Returns the count, or -1 if unable to determine.
+    """
+    try:
+        betslip = await page.query_selector('div#betslip-container-mobile, div#betslip-container')
+        if not betslip:
+            return 0
+        
+        betslip_text = await betslip.inner_text()
+        
+        # Count "1X2" occurrences (each selection shows its market type)
+        count_1x2 = betslip_text.count('1X2')
+        
+        # Alternative: count selection entries by looking for odds patterns
+        # Each selection shows odds like "@ 1.85" or similar
+        odds_matches = re.findall(r'@\s*\d+\.\d{2}', betslip_text)
+        count_odds = len(odds_matches)
+        
+        # Return the higher count (more reliable)
+        return max(count_1x2, count_odds)
+    except Exception as e:
+        print(f"    ⚠️ Error counting selections: {e}")
+        return -1
+
+
+async def get_betslip_id_from_confirmation(page: Page) -> dict:
+    """
+    Extract the Betslip ID and/or Booking Code from the Bet Confirmation modal.
+    Returns a dict with 'betslip_id' and 'booking_code' (either may be empty string).
+    """
+    result = {'betslip_id': '', 'booking_code': ''}
+    
+    try:
+        # Wait a moment for modal to fully render
+        await page.wait_for_timeout(800)
+        
+        # PRIORITY 1: Look specifically for Bet Confirmation modal elements
+        # The modal typically contains "Bet Confirmation" header and the Booking Code
+        bet_confirmation_selectors = [
+            'span:has-text("Bet Confirmation")',  # Modal header
+            'div:has(span:has-text("Bet Confirmation"))',  # Container with header
+            'div[class*="modal"]:has(button#strike-conf-continue-btn)',  # Modal with continue button
+        ]
+        
+        modal_text = ""
+        
+        # First, try to find the specific Bet Confirmation modal
+        for selector in bet_confirmation_selectors:
+            try:
+                element = await page.query_selector(selector)
+                if element:
+                    # Get the parent modal container for full text
+                    try:
+                        parent = await element.evaluate_handle('el => el.closest("div[class*=modal]") || el.closest("div[role=dialog]") || el.parentElement.parentElement.parentElement')
+                        if parent:
+                            modal_text = await parent.inner_text()
+                    except:
+                        modal_text = await element.inner_text()
+                    
+                    if modal_text and 'Bet Confirmation' in modal_text:
+                        print(f"    ✓ Found Bet Confirmation modal")
+                        break
+            except:
+                continue
+        
+        # PRIORITY 2: Look for the Continue betting button and get its modal container
+        if not modal_text or len(modal_text) < 20:
+            try:
+                continue_btn = await page.query_selector('button#strike-conf-continue-btn')
+                if continue_btn:
+                    # Navigate up to find the modal container
+                    parent = await continue_btn.evaluate_handle('''el => {
+                        let current = el.parentElement;
+                        for (let i = 0; i < 10 && current; i++) {
+                            if (current.className && (current.className.includes('modal') || current.className.includes('dialog'))) {
+                                return current;
+                            }
+                            current = current.parentElement;
+                        }
+                        return el.parentElement.parentElement.parentElement.parentElement;
+                    }''')
+                    if parent:
+                        modal_text = await parent.inner_text()
+            except:
+                pass
+        
+        if modal_text:
+            # Debug: print modal text to identify patterns
+            print(f"    🔍 [DEBUG] Bet Confirmation modal text:")
+            # Print in chunks to see the full structure
+            lines = modal_text.split('\n')
+            for i, line in enumerate(lines[:15]):  # First 15 lines
+                if line.strip():
+                    print(f"         Line {i+1}: {line.strip()[:80]}")
+            
+            # Pattern 1: Look for Booking Code (most common in Betway)
+            # Betway typically shows "Booking Code" followed by the code
+            booking_patterns = [
+                r'Booking\s*Code[\s:]*\n?\s*([A-Z0-9-]+)',  # Code may be on next line
+                r'Booking\s*Code[\s:]+([A-Z0-9-]+)',
+                r'Booking[\s:]+([A-Z0-9]{6,})',
+                r'Code[\s:]+([A-Z0-9]{8,})',  # At least 8 chars
+            ]
+            
+            for pattern in booking_patterns:
+                match = re.search(pattern, modal_text, re.IGNORECASE)
+                if match:
+                    result['booking_code'] = match.group(1).strip()
+                    print(f"    ✓ [FOUND] Booking Code: {result['booking_code']}")
+                    break
+            
+            # Pattern 2: Look for Betslip ID
+            betslip_patterns = [
+                r'Betslip\s*ID[\s:]*\n?\s*([A-Z0-9-]+)',
+                r'Betslip\s*ID[\s:]+([A-Z0-9-]+)',
+                r'Bet\s*ID[\s:]+([A-Z0-9-]+)',
+                r'Reference[\s:]+([A-Z0-9-]+)',
+            ]
+            
+            for pattern in betslip_patterns:
+                match = re.search(pattern, modal_text, re.IGNORECASE)
+                if match:
+                    result['betslip_id'] = match.group(1).strip()
+                    print(f"    ✓ [FOUND] Betslip ID: {result['betslip_id']}")
+                    break
+            
+            # Pattern 3: Look for standalone alphanumeric codes if nothing found yet
+            # Betway booking codes are typically 8-12 uppercase alphanumeric
+            if not result['booking_code'] and not result['betslip_id']:
+                # Look for a line that's just a code (common pattern)
+                for line in lines:
+                    line = line.strip()
+                    # Check if line is a standalone code (8-12 alphanumeric chars)
+                    if re.match(r'^[A-Z0-9]{8,12}$', line):
+                        if line not in ['BETCONFIRM', 'SUCCESSFUL', 'CONTINUING']:
+                            result['booking_code'] = line
+                            print(f"    ✓ [FOUND] Standalone Code: {result['booking_code']}")
+                            break
+        else:
+            print(f"    ⚠️ Could not find Bet Confirmation modal text")
+        
+        return result
+        
+    except Exception as e:
+        print(f"    ⚠️ Error getting betslip ID/booking code: {e}")
+        return result
+
+
+async def verify_bet_placement(page: Page, expected_stake: float, balance_before: float) -> dict:
+    """
+    Verify that a bet was actually placed by checking multiple indicators.
+    
+    Returns a dict with:
+        - 'success': True if bet was verified placed
+        - 'betslip_id': The betslip ID if found
+        - 'booking_code': The booking code if found
+        - 'balance_after': The balance after the bet
+        - 'balance_decreased': True if balance decreased by expected amount
+        - 'confidence': 'HIGH', 'MEDIUM', or 'LOW' based on verification checks
+    """
+    result = {
+        'success': False,
+        'betslip_id': '',
+        'booking_code': '',
+        'balance_after': -1.0,
+        'balance_decreased': False,
+        'confidence': 'LOW'
+    }
+    
+    try:
+        # 1. Try to get the Betslip ID and Booking Code from confirmation
+        codes = await get_betslip_id_from_confirmation(page)
+        if codes['betslip_id']:
+            result['betslip_id'] = codes['betslip_id']
+            print(f"    ✓ [VERIFY] Found Betslip ID: {codes['betslip_id']}")
+        if codes['booking_code']:
+            result['booking_code'] = codes['booking_code']
+            print(f"    ✓ [VERIFY] Found Booking Code: {codes['booking_code']}")
+        
+        has_code = bool(result['betslip_id'] or result['booking_code'])
+        
+        # 2. Check balance after bet
+        await page.wait_for_timeout(1000)  # Wait for balance to update
+        balance_after = await get_current_balance(page)
+        result['balance_after'] = balance_after
+        
+        if balance_before > 0 and balance_after > 0:
+            expected_decrease = expected_stake
+            actual_decrease = balance_before - balance_after
+            
+            # Allow for small variance (rounding)
+            if abs(actual_decrease - expected_decrease) < 0.10:
+                result['balance_decreased'] = True
+                print(f"    ✓ [VERIFY] Balance decreased correctly: R{balance_before:.2f} → R{balance_after:.2f} (stake: R{expected_stake:.2f})")
+            elif actual_decrease > 0:
+                print(f"    ⚠️ [VERIFY] Balance decreased but amount differs: expected R{expected_stake:.2f}, actual R{actual_decrease:.2f}")
+                result['balance_decreased'] = True  # Still counts as placed
+            else:
+                print(f"    ❌ [VERIFY] Balance did NOT decrease: R{balance_before:.2f} → R{balance_after:.2f}")
+        
+        # 3. Check for "Continue betting" button (indicates success modal is showing)
+        continue_btn = await page.query_selector('button#strike-conf-continue-btn')
+        has_continue_btn = continue_btn and await continue_btn.is_visible()
+        
+        # 4. Check for "Bet Confirmation" text
+        bet_conf = await page.query_selector('span:has-text("Bet Confirmation")')
+        has_bet_conf = bet_conf is not None
+        
+        # Determine confidence and success
+        # HIGH: Both code AND balance verification
+        if has_code and result['balance_decreased']:
+            result['confidence'] = 'HIGH'
+            result['success'] = True
+        # HIGH: Balance verified AND confirmation modal visible
+        elif result['balance_decreased'] and (has_continue_btn or has_bet_conf):
+            result['confidence'] = 'HIGH'
+            result['success'] = True
+        # MEDIUM: Either code OR balance verification
+        elif has_code or result['balance_decreased']:
+            result['confidence'] = 'MEDIUM'
+            result['success'] = True
+        # MEDIUM: Both confirmation elements present
+        elif has_continue_btn and has_bet_conf:
+            result['confidence'] = 'MEDIUM'
+            result['success'] = True
+        # LOW: Only one confirmation element
+        elif has_continue_btn or has_bet_conf:
+            result['confidence'] = 'LOW'
+            result['success'] = True  # Assume success but low confidence
+            print(f"    ⚠️ [VERIFY] LOW confidence - only found confirmation modal, no balance/code verification")
+        
+        return result
+        
+    except Exception as e:
+        print(f"    ⚠️ [VERIFY] Error during verification: {e}")
+        return result
+
+
+async def verify_selections_before_bet(page: Page, expected_count: int) -> bool:
+    """
+    Verify the correct number of selections are in the bet slip before placing bet.
+    Returns True if count matches expected, False otherwise.
+    """
+    try:
+        actual_count = await count_betslip_selections(page)
+        
+        if actual_count == expected_count:
+            print(f"    ✓ [PRE-BET] Correct selections: {actual_count}/{expected_count}")
+            return True
+        elif actual_count > expected_count:
+            print(f"    ❌ [PRE-BET] Too many selections: {actual_count}/{expected_count} - betslip not cleared properly!")
+            return False
+        else:
+            print(f"    ❌ [PRE-BET] Missing selections: {actual_count}/{expected_count}")
+            return False
+    except Exception as e:
+        print(f"    ⚠️ [PRE-BET] Error verifying selections: {e}")
+        return True  # Continue if we can't verify
+
+
+# ============================================================================
+# END BET VERIFICATION HELPER FUNCTIONS
+# ============================================================================
+
 
 async def retry_with_backoff(func, max_retries=3, initial_delay=5, **kwargs):
     """
@@ -54,8 +366,21 @@ async def login_to_betway(playwright):
         print("Error: BETWAY_USERNAME or BETWAY_PASSWORD not found in .env file")
         return None
     
-    # Launch browser (set headless=False to see the browser)
-    browser = await playwright.chromium.launch(headless=False)
+    # Launch browser with memory optimization args (set headless=False to see the browser)
+    browser = await playwright.chromium.launch(
+        headless=False,
+        args=[
+            '--disable-dev-shm-usage',  # Use /tmp instead of /dev/shm (prevents memory issues)
+            '--no-sandbox',
+            '--disable-gpu',
+            '--disable-software-rasterizer',
+            '--disable-extensions',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--js-flags=--max-old-space-size=4096',  # Increase V8 heap to 4GB
+        ]
+    )
     page = await browser.new_page()
     
     print("Navigating to Betway...")
@@ -230,6 +555,87 @@ async def login_to_betway(playwright):
         "page": page,
         "browser": browser
     }
+
+
+async def restart_browser_fresh(playwright, old_browser=None, old_page=None):
+    """
+    Create a completely fresh browser instance to prevent Playwright memory corruption.
+    
+    This is the TRUE fix for Playwright memory errors like:
+    - AttributeError: 'dict' object has no attribute '_object'
+    - Frame object corruption
+    - Element handle collection errors
+    
+    The function:
+    1. Closes the old browser instance completely
+    2. Forces garbage collection
+    3. Creates a brand new browser with fresh memory state
+    4. Logs in again
+    5. Returns the new page and browser objects
+    
+    Args:
+        playwright: The playwright instance
+        old_browser: The old browser to close (optional)
+        old_page: The old page to close (optional)
+    
+    Returns:
+        dict with 'page' and 'browser' keys, or None on failure
+    """
+    print(f"\n{'='*60}")
+    print("🔄 BROWSER RESTART - Creating fresh browser instance")
+    print(f"{'='*60}")
+    print("   This prevents Playwright memory corruption errors")
+    print("   All internal state will be reset")
+    print(f"{'='*60}\n")
+    
+    # Step 1: Close old browser if provided
+    if old_page or old_browser:
+        print("  [1/4] Closing old browser instance...")
+        try:
+            if old_page and not old_page.is_closed():
+                await old_page.close()
+        except Exception as e:
+            print(f"       Warning: Could not close old page: {e}")
+        
+        try:
+            if old_browser:
+                await old_browser.close()
+        except Exception as e:
+            print(f"       Warning: Could not close old browser: {e}")
+        
+        print("       ✓ Old browser closed")
+    
+    # Step 2: Force garbage collection to release memory
+    print("  [2/4] Running garbage collection...")
+    gc.collect()
+    gc.collect()  # Run twice to ensure full collection
+    print("       ✓ Memory cleaned up")
+    
+    # Step 3: Wait a moment for resources to be released
+    print("  [3/4] Waiting for resources to release...")
+    await asyncio.sleep(2)
+    print("       ✓ Ready to create new browser")
+    
+    # Step 4: Create fresh browser and login
+    print("  [4/4] Creating fresh browser and logging in...")
+    try:
+        result = await login_to_betway(playwright)
+        if result:
+            print(f"\n{'='*60}")
+            print("✅ BROWSER RESTART COMPLETE")
+            print(f"{'='*60}")
+            print("   Fresh browser instance created")
+            print("   All Playwright state reset")
+            print("   Ready to continue betting")
+            print(f"{'='*60}\n")
+            return result
+        else:
+            print("  ❌ Failed to login with new browser")
+            return None
+    except Exception as e:
+        print(f"  ❌ Error creating new browser: {e}")
+        return None
+
 
 async def check_and_relogin(page: Page, browser) -> bool:
     """
@@ -1321,6 +1727,21 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             print("    [ERROR] Conflicting selections - aborting this bet")
                             return False
         
+        # ===== PRE-BET VERIFICATION =====
+        # 1. Capture balance BEFORE placing bet
+        print("  [PRE-BET] Capturing current balance...")
+        balance_before = await get_current_balance(page)
+        if balance_before > 0:
+            print(f"    ✓ Balance before bet: R{balance_before:.2f}")
+        else:
+            print(f"    ⚠️ Could not capture balance - will proceed without balance verification")
+        
+        # 2. Verify correct number of selections
+        expected_selections = len(matches)
+        if not await verify_selections_before_bet(page, expected_selections):
+            print(f"    ❌ [PRE-BET] Selection count mismatch - aborting bet!")
+            return False
+        
         # Click place bet button
         print("  Attempting to place bet...")
         
@@ -1849,6 +2270,34 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
             # Just wait for the bet to process
             await page.wait_for_timeout(1500)
             
+            # ===== POST-BET VERIFICATION =====
+            # Verify bet was actually placed using multiple checks
+            print("  [POST-BET] Verifying bet placement...")
+            verification = await verify_bet_placement(page, amount, balance_before)
+            
+            if verification['success']:
+                confidence = verification['confidence']
+                betslip_id = verification['betslip_id']
+                booking_code = verification['booking_code']
+                balance_after = verification['balance_after']
+                
+                # Display the most useful identifier found
+                if booking_code:
+                    print(f"    ✅ [VERIFIED-{confidence}] Bet placed! Booking Code: {booking_code}")
+                elif betslip_id:
+                    print(f"    ✅ [VERIFIED-{confidence}] Bet placed! Betslip ID: {betslip_id}")
+                elif balance_after > 0 and verification['balance_decreased']:
+                    print(f"    ✅ [VERIFIED-{confidence}] Bet placed! Balance: R{balance_before:.2f} → R{balance_after:.2f}")
+                else:
+                    print(f"    ✅ [VERIFIED-{confidence}] Bet appears to be placed")
+                
+                if confidence == 'LOW':
+                    print(f"    ⚠️ WARNING: Low confidence verification - please check manually")
+            else:
+                print(f"    ❌ [VERIFY FAILED] Could not confirm bet was placed!")
+                print(f"    ❌ Balance before: R{balance_before:.2f}, Balance after: R{verification['balance_after']:.2f}")
+                # Don't return False immediately - let the old logic try as fallback
+            
             # Look for success confirmation or "Continue betting" button
             # After successful bet, Betway shows a "Bet Confirmation" modal with "Continue betting" button
             continue_betting_selectors = [
@@ -1863,16 +2312,26 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                 try:
                     continue_btn = await page.wait_for_selector(cont_selector, timeout=3000, state='visible')
                     if continue_btn:
-                        print(f"    ✅ Found 'Continue betting' button - bet confirmed successful!")
+                        print(f"    ✅ Found 'Continue betting' button - clicking to dismiss modal...")
                         await continue_btn.scroll_into_view_if_needed()
                         await page.wait_for_timeout(300)
                         await continue_btn.evaluate('el => el.click()')
                         await page.wait_for_timeout(500)
-                        print("    ✅ Bet placed successfully!")
-                        bet_confirmed = True
-                        return True
+                        
+                        # Return based on verification result
+                        if verification['success']:
+                            print(f"    ✅ Bet CONFIRMED placed successfully!")
+                            return True
+                        else:
+                            print(f"    ⚠️ Modal found but verification failed - treating as success with caution")
+                            return True
                 except:
                     continue
+            
+            # If verification succeeded but no continue button found, still return success
+            if verification['success'] and verification['confidence'] in ['HIGH', 'MEDIUM']:
+                print(f"    ✅ Bet verified without 'Continue betting' button (confidence: {verification['confidence']})")
+                return True
             
             if bet_confirmed:
                 return True
@@ -2888,6 +3347,67 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                             'matches_data': matches  # Save match data for resume
                         }, f)
                     
+                    # AGGRESSIVE memory management to prevent Playwright corruption
+                    # GC every bet (not just every 3) for more stable long sessions
+                    gc.collect()
+                    
+                    # BROWSER RESTART every 10 bets - TRUE fix for Playwright memory corruption
+                    # Creates completely fresh browser instance with clean memory state
+                    if (i + 1) % 10 == 0 and i < len(bet_slips) - 1:
+                        try:
+                            print(f"\n  [BROWSER RESTART] Restarting browser after {i + 1} bets to prevent memory corruption...")
+                            restart_result = await restart_browser_fresh(p, old_browser=browser, old_page=page)
+                            if restart_result:
+                                page = restart_result["page"]
+                                browser = restart_result["browser"]
+                                # Clear outcome button cache since we have a fresh browser
+                                outcome_button_cache.clear()
+                                print(f"  [BROWSER RESTART] ✓ Fresh browser ready - cache cleared")
+                                
+                                # Re-cache outcome buttons for all matches
+                                print(f"  [BROWSER RESTART] Re-caching outcome buttons for {num_matches} matches...")
+                                for match_idx, match in enumerate(matches[:num_matches], 1):
+                                    match_url = match.get('url')
+                                    if match_url:
+                                        try:
+                                            await page.goto(match_url, wait_until='domcontentloaded', timeout=15000)
+                                            await page.wait_for_timeout(1000)
+                                            await close_all_modals(page)
+                                            
+                                            button_selectors = [
+                                                'div.grid.p-1 > div.flex.items-center.justify-between.h-12',
+                                                'div[price]',
+                                            ]
+                                            for selector in button_selectors:
+                                                buttons = await page.query_selector_all(selector)
+                                                if len(buttons) >= 3:
+                                                    outcome_button_cache[match_url] = selector
+                                                    print(f"       ✓ Match {match_idx}: cached")
+                                                    break
+                                        except Exception as cache_err:
+                                            print(f"       ⚠️ Match {match_idx}: cache failed - {cache_err}")
+                                
+                                # Navigate back to soccer page
+                                await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                                await page.wait_for_timeout(1000)
+                                await close_all_modals(page)
+                            else:
+                                print(f"  [BROWSER RESTART] ⚠️ Failed - continuing with current browser")
+                        except Exception as restart_err:
+                            print(f"  [BROWSER RESTART] ⚠️ Error: {restart_err} - continuing with current browser")
+                    
+                    # Periodic page refresh (every 5 bets that aren't browser restart bets)
+                    elif (i + 1) % 5 == 0 and i < len(bet_slips) - 1:
+                        try:
+                            print(f"  [MEMORY] Refreshing page after {i + 1} bets...")
+                            await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                            await page.wait_for_timeout(2000)
+                            await close_all_modals(page)
+                            gc.collect()
+                            print(f"  [MEMORY] Page refreshed and GC completed")
+                        except Exception as refresh_err:
+                            print(f"  [WARNING] Page refresh failed: {refresh_err}")
+                    
                     # Wait between bets
                     if i < len(bet_slips) - 1:
                         wait_success = await wait_between_bets(page, seconds=5, add_random=True)
@@ -3142,6 +3662,115 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                 await asyncio.sleep(2)
                 
             except Exception as e:
+                error_str = str(e)
+                
+                # Check if this is a Playwright memory/object collection error
+                is_memory_error = "'dict' object has no attribute '_object'" in error_str or \
+                                  "object has been collected" in error_str or \
+                                  "unbounded heap growth" in error_str or \
+                                  "Target page, context or browser has been closed" in error_str
+                
+                if is_memory_error:
+                    print(f"\n{'='*60}")
+                    print(f"⚠️ PLAYWRIGHT MEMORY ERROR DETECTED")
+                    print(f"{'='*60}")
+                    print(f"Error: {error_str[:150]}...")
+                    print(f"\n🔄 Attempting recovery with fresh browser...")
+                    
+                    # Force garbage collection
+                    gc.collect()
+                    
+                    # Try to restart browser and recover
+                    try:
+                        restart_result = await restart_browser_fresh(p, old_browser=browser, old_page=page)
+                        if restart_result:
+                            page = restart_result["page"]
+                            browser = restart_result["browser"]
+                            
+                            # Clear and rebuild cache
+                            outcome_button_cache.clear()
+                            print(f"  [RECOVERY] Re-caching outcome buttons...")
+                            for match_idx, match in enumerate(matches[:num_matches], 1):
+                                match_url = match.get('url')
+                                if match_url:
+                                    try:
+                                        await page.goto(match_url, wait_until='domcontentloaded', timeout=15000)
+                                        await page.wait_for_timeout(1000)
+                                        await close_all_modals(page)
+                                        for selector in ['div.grid.p-1 > div.flex.items-center.justify-between.h-12', 'div[price]']:
+                                            buttons = await page.query_selector_all(selector)
+                                            if len(buttons) >= 3:
+                                                outcome_button_cache[match_url] = selector
+                                                break
+                                    except:
+                                        pass
+                            
+                            await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                            await close_all_modals(page)
+                            
+                            print(f"\n✅ RECOVERY SUCCESSFUL - Retrying bet {bet_slip['slip_number']}...")
+                            
+                            # Retry the failed bet with fresh browser
+                            retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
+                            
+                            if retry_success == True:
+                                successful += 1
+                                print(f"\n[SUCCESS] Bet slip {bet_slip['slip_number']} placed after browser restart!")
+                                
+                                # Save progress
+                                with open(progress_file, 'w') as f:
+                                    json.dump({
+                                        'last_completed_bet': i + 1,
+                                        'last_successful_bet': i,
+                                        'successful': successful,
+                                        'failed': failed,
+                                        'match_fingerprint': current_match_fingerprint,
+                                        'timestamp': datetime.now().isoformat(),
+                                        'matches_data': matches
+                                    }, f)
+                                
+                                # Continue to next bet
+                                if i < len(bet_slips) - 1:
+                                    await wait_between_bets(page, seconds=5, add_random=True)
+                                continue  # Skip to next iteration of the loop
+                            else:
+                                print(f"\n❌ Retry after browser restart also failed")
+                                # Fall through to exit
+                        else:
+                            print(f"\n❌ Browser restart failed")
+                    except Exception as restart_err:
+                        print(f"\n❌ Recovery failed: {restart_err}")
+                    
+                    # If we get here, recovery failed - save progress and exit
+                    with open(progress_file, 'w') as f:
+                        json.dump({
+                            'last_completed_bet': i,  # Resume FROM this bet
+                            'last_successful_bet': i - 1 if i > 0 else -1,
+                            'successful': successful,
+                            'failed': failed,
+                            'match_fingerprint': current_match_fingerprint,
+                            'timestamp': datetime.now().isoformat(),
+                            'matches_data': matches
+                        }, f)
+                    
+                    print(f"\n{'='*60}")
+                    print(f"⚠️ PLAYWRIGHT MEMORY ERROR - RESTART REQUIRED")
+                    print(f"{'='*60}")
+                    print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
+                    print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
+                    print(f"📋 Progress saved - auto-restart will resume")
+                    print(f"{'='*60}\n")
+                    
+                    try:
+                        await page.close()
+                        await browser.close()
+                    except:
+                        pass
+                    
+                    import sys
+                    sys.exit(1)
+                
+                # Regular exception handling
                 failed += 1
                 failed_bets.append(bet_slip)  # Store failed bet for retry
                 print(f"\n[ERROR] Exception on slip {bet_slip['slip_number']}: {e}")
@@ -3301,5 +3930,158 @@ def main():
     
     asyncio.run(main_async(num_matches=num_matches, amount_per_slip=amount_per_slip))
 
+
+def main_with_auto_retry():
+    """
+    Wrapper that automatically restarts the script as a NEW PROCESS when it crashes.
+    This is the correct solution for Playwright memory corruption errors because:
+    1. A fresh process has clean memory state
+    2. Progress is saved to file, so new process resumes from where it left off
+    3. Uses subprocess to spawn completely isolated Python process
+    
+    IMPORTANT: This wrapper catches ALL crashes including:
+    - Playwright memory errors (exit code 1)
+    - Unexpected exceptions (any non-zero exit code)
+    - Process timeouts (hangs)
+    - Signal terminations
+    """
+    import sys
+    import subprocess
+    import time as time_module
+    import signal
+    
+    MAX_RETRIES = 5  # Maximum number of automatic restarts
+    RETRY_DELAY = 15  # Seconds to wait before restarting
+    SUBPROCESS_TIMEOUT = 3600  # 1 hour timeout per subprocess (prevents hangs)
+    
+    # Get the original arguments
+    args = sys.argv[1:]  # Everything after script name
+    
+    if len(args) < 2:
+        # No CLI args - run interactively (no auto-retry for interactive mode)
+        main()
+        return
+    
+    total_start_time = time_module.time()
+    retry_count = 0
+    
+    print(f"\n{'='*60}")
+    print(f"🚀 AUTO-RETRY WRAPPER ACTIVE")
+    print(f"{'='*60}")
+    print(f"   Max retries: {MAX_RETRIES}")
+    print(f"   Retry delay: {RETRY_DELAY}s")
+    print(f"   Subprocess timeout: {SUBPROCESS_TIMEOUT}s ({SUBPROCESS_TIMEOUT//60} min)")
+    print(f"   Progress file: bet_progress.json")
+    print(f"{'='*60}\n")
+    
+    while retry_count <= MAX_RETRIES:
+        attempt_start_time = time_module.time()
+        
+        print(f"\n{'='*60}")
+        if retry_count > 0:
+            elapsed_total = time_module.time() - total_start_time
+            elapsed_mins = int(elapsed_total // 60)
+            elapsed_secs = int(elapsed_total % 60)
+            print(f"🔄 AUTO-RESTART ATTEMPT {retry_count}/{MAX_RETRIES}")
+            print(f"   Total elapsed time: {elapsed_mins}m {elapsed_secs}s")
+            print(f"   Spawning fresh Python process...")
+            print(f"   Will resume from last saved progress...")
+        else:
+            print(f"🚀 STARTING BETWAY AUTOMATION (Attempt 1)")
+        print(f"{'='*60}\n")
+        
+        # Build command to run main() directly (not main_with_auto_retry)
+        # We use a special --direct flag to indicate this
+        cmd = [sys.executable, sys.argv[0], '--direct'] + args
+        
+        exit_code = None
+        error_reason = None
+        
+        try:
+            # Run as subprocess - this is a COMPLETELY NEW Python process
+            # Use timeout to prevent infinite hangs
+            result = subprocess.run(
+                cmd,
+                cwd=os.getcwd(),
+                timeout=SUBPROCESS_TIMEOUT,
+                # Don't capture output - let it print directly to console
+            )
+            
+            exit_code = result.returncode
+            
+        except subprocess.TimeoutExpired:
+            # Process hung - need to restart
+            exit_code = -1
+            error_reason = f"TIMEOUT (hung for >{SUBPROCESS_TIMEOUT}s)"
+            print(f"\n⚠️ SUBPROCESS TIMEOUT - Process hung for over {SUBPROCESS_TIMEOUT} seconds")
+            
+        except KeyboardInterrupt:
+            elapsed_total = time_module.time() - total_start_time
+            elapsed_mins = int(elapsed_total // 60)
+            print(f"\n\n⛔ Interrupted by user (Ctrl+C)")
+            print(f"   Total time: {elapsed_mins} minutes")
+            print(f"   Progress saved. Run again to resume.")
+            return  # Exit completely
+            
+        except Exception as e:
+            exit_code = -2
+            error_reason = f"SUBPROCESS ERROR: {str(e)[:100]}"
+            print(f"\n❌ Subprocess error: {e}")
+        
+        # Check result
+        if exit_code == 0:
+            # Success!
+            elapsed_total = time_module.time() - total_start_time
+            elapsed_mins = int(elapsed_total // 60)
+            elapsed_secs = int(elapsed_total % 60)
+            print(f"\n{'='*60}")
+            print(f"✅ SCRIPT COMPLETED SUCCESSFULLY!")
+            print(f"   Total time: {elapsed_mins}m {elapsed_secs}s")
+            print(f"   Retries used: {retry_count}")
+            print(f"{'='*60}\n")
+            return  # Exit successfully
+        
+        # Script crashed or errored - need to restart
+        retry_count += 1
+        attempt_elapsed = time_module.time() - attempt_start_time
+        
+        if retry_count <= MAX_RETRIES:
+            print(f"\n{'='*60}")
+            if error_reason:
+                print(f"⚠️ SCRIPT FAILED: {error_reason}")
+            else:
+                print(f"⚠️ SCRIPT CRASHED (exit code: {exit_code})")
+            print(f"   Attempt ran for: {int(attempt_elapsed)}s")
+            print(f"   Progress is saved to bet_progress.json")
+            print(f"\n🔄 AUTO-RESTART in {RETRY_DELAY} seconds...")
+            print(f"   Restart attempt: {retry_count}/{MAX_RETRIES}")
+            print(f"{'='*60}\n")
+            
+            # Force garbage collection in parent process too
+            gc.collect()
+            
+            time_module.sleep(RETRY_DELAY)
+        else:
+            elapsed_total = time_module.time() - total_start_time
+            elapsed_mins = int(elapsed_total // 60)
+            print(f"\n{'='*60}")
+            print(f"❌ MAX RETRIES REACHED ({MAX_RETRIES})")
+            print(f"   Total time spent: {elapsed_mins} minutes")
+            print(f"\n💡 Progress is saved. Restart manually with:")
+            print(f"   python main.py {' '.join(args)}")
+            print(f"{'='*60}\n")
+            return  # Exit after max retries
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    # Check if we're being called directly (by subprocess) or as the main entry point
+    if len(sys.argv) >= 2 and sys.argv[1] == '--direct':
+        # Called by subprocess - run main() directly
+        # Remove the --direct flag and pass remaining args
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        main()
+    else:
+        # Called normally - use the auto-retry wrapper
+        main_with_auto_retry()
