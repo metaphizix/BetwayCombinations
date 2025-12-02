@@ -5,6 +5,7 @@ import asyncio
 import os
 import json
 import random
+import math
 from itertools import product
 from playwright.async_api import async_playwright, Page
 from playwright._impl._errors import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
@@ -700,66 +701,82 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                 print(f"  ⚠️ Navigation failed: {nav_error}")
                 return False
         
-        # Clear betslip by navigating to the soccer page (more reliable than reload)
-        print("  Navigating to clear betslip...")
-        try:
-            await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=20000)
-            await page.wait_for_timeout(1500)
-        except Exception as goto_error:
-            print(f"  ⚠️ Navigation failed: {goto_error} - trying alternative...")
-            # Try without wait_until
-            try:
-                await page.goto('https://new.betway.co.za/sport/soccer/upcoming', timeout=20000)
-                await page.wait_for_timeout(2000)
-            except:
-                print(f"  ⚠️ Could not navigate - aborting bet")
-                return False
+        # Clear betslip using the "Remove All" button (more reliable than navigation)
+        print("  Clearing betslip...")
+        betslip_cleared = False
         
+        # First, check if betslip has any selections
         try:
-            await close_all_modals(page, max_attempts=3)  # More aggressive modal closing
-        except Exception as modal_error:
-            print(f"  ⚠️ Modal closing failed: {modal_error} - continuing anyway...")
-        
-        # VERIFY betslip is actually empty
-        await page.wait_for_timeout(500)
-        betslip_has_selections = False
-        try:
-            betslip_check = await page.query_selector('div#betslip-container-mobile')
-            if not betslip_check:
-                betslip_check = await page.query_selector('div#betslip-container')
+            betslip_check = await page.query_selector('div#betslip-container-mobile, div#betslip-container')
             if betslip_check:
                 betslip_text = await betslip_check.inner_text()
-                # Check for actual bet selections - look for odds values (like "2.55" or team names with odds)
-                # Empty betslip has "Single" and "Multi" tabs but no actual selections
-                # A bet selection would have patterns like: team name + odds, or "Total Betway Return" with a value
-                has_odds_value = bool(re.search(r'\d+\.\d{2}', betslip_text))  # Odds like 2.55, 3.15
-                has_return_value = 'Total Betway Return' in betslip_text and 'R ' in betslip_text
-                has_bet_button = 'Bet Now' in betslip_text
+                # Check for actual bet selections
+                has_odds_value = bool(re.search(r'\d+\.\d{2}', betslip_text))
+                has_return_value = 'Total Betway Return' in betslip_text or 'Return' in betslip_text
+                has_bet_content = '1X2' in betslip_text or has_return_value
                 
-                # Betslip has actual selections if it has odds AND (return value OR bet button)
-                betslip_has_selections = has_odds_value and (has_return_value or has_bet_button)
-                
-                if betslip_has_selections:
-                    print("    ⚠️  WARNING: Betslip not empty after reload! Attempting to clear...")
-                    # Try clicking remove all button
-                    try:
-                        remove_all = await page.query_selector('div#betslip-remove-all')
-                        if remove_all:
-                            await remove_all.click()
-                            await page.wait_for_timeout(500)
-                            print("    ✅ Clicked 'Remove All' button")
-                        else:
-                            # Alternative: try to reload the page again
-                            await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
-                            await page.wait_for_timeout(1000)
-                            print("    [OK] Page reloaded - betslip is empty")
-                    except:
-                        pass
+                if has_odds_value and has_bet_content:
+                    print("    ⚠️ Betslip has existing selections - clearing...")
+                    
+                    # Method 1: Use the "Remove All" button (most reliable)
+                    remove_all_btn = await page.query_selector('div#betslip-remove-all')
+                    if remove_all_btn and await remove_all_btn.is_visible():
+                        await remove_all_btn.click()
+                        await page.wait_for_timeout(800)
+                        print("    ✅ Clicked 'Remove All' button")
+                        betslip_cleared = True
+                    else:
+                        # Method 2: Try to find and click individual remove buttons
+                        remove_btns = await page.query_selector_all('svg[id="betslip-remove-all"], div#betslip-remove-all svg')
+                        for btn in remove_btns:
+                            try:
+                                if await btn.is_visible():
+                                    await btn.click()
+                                    await page.wait_for_timeout(500)
+                                    print("    ✅ Clicked remove button via SVG")
+                                    betslip_cleared = True
+                                    break
+                            except:
+                                continue
+                        
+                        if not betslip_cleared:
+                            # Method 3: Navigate to clear (fallback)
+                            print("    ⚠️ Remove button not found - using navigation fallback...")
+                            await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=20000)
+                            await page.wait_for_timeout(1500)
+                else:
+                    print("    [OK] Betslip is empty - ready to add selections")
+                    betslip_cleared = True
+            else:
+                print("    [OK] No betslip container found - proceeding")
+                betslip_cleared = True
         except Exception as e:
-            print(f"    Could not verify betslip: {e}")
+            print(f"    ⚠️ Error checking betslip: {e}")
         
-        if not betslip_has_selections:
-            print("    [OK] Betslip is empty - ready to add selections")
+        # Verify betslip is now empty
+        if betslip_cleared:
+            await page.wait_for_timeout(500)
+            try:
+                betslip_recheck = await page.query_selector('div#betslip-container-mobile, div#betslip-container')
+                if betslip_recheck:
+                    recheck_text = await betslip_recheck.inner_text()
+                    still_has_bets = bool(re.search(r'\d+\.\d{2}', recheck_text)) and '1X2' in recheck_text
+                    if still_has_bets:
+                        print("    ⚠️ Betslip still has selections after clear attempt!")
+                        # Try remove all one more time
+                        remove_all_btn = await page.query_selector('div#betslip-remove-all')
+                        if remove_all_btn:
+                            await remove_all_btn.click()
+                            await page.wait_for_timeout(800)
+                            print("    ✅ Second attempt - clicked 'Remove All'")
+            except:
+                pass
+        
+        # Close any modals that may have appeared
+        try:
+            await close_all_modals(page, max_attempts=2)
+        except:
+            pass
         
         # Click on each match outcome
         for i, (match, selection) in enumerate(zip(matches, selections)):
@@ -1258,12 +1275,30 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
             # Check if betslip has correct number of selections
             selection_count = betslip_text.count('1X2')
             expected_count = len(matches)
-            if selection_count > expected_count:
-                print(f"\n    ❌ [ERROR] Too many selections in betslip!")
-                print(f"    Expected: {expected_count} selections")
-                print(f"    Found: {selection_count} selections")
-                print(f"    ❌ ABORTING - betslip not properly cleared\n")
-                return False
+            
+            if selection_count != expected_count:
+                print(f"\n    ❌ [ERROR] Wrong number of selections in betslip!")
+                print(f"    Expected: {expected_count} selection(s)")
+                print(f"    Found: {selection_count} selection(s)")
+                
+                if selection_count > expected_count:
+                    print(f"    ❌ Too many selections - betslip not properly cleared")
+                elif selection_count < expected_count:
+                    print(f"    ❌ Missing selections - not all matches were added")
+                
+                print(f"    ❌ ABORTING - will retry with cleared betslip\n")
+                
+                # Try to clear the betslip before returning
+                try:
+                    remove_all_btn = await page.query_selector('div#betslip-remove-all')
+                    if remove_all_btn and await remove_all_btn.is_visible():
+                        await remove_all_btn.click()
+                        await page.wait_for_timeout(500)
+                        print(f"    ✓ Cleared betslip for retry")
+                except:
+                    pass
+                
+                return "RETRY"  # Signal retry instead of hard failure
             
             # Check for error messages in betslip
             error_selectors = [
@@ -1949,14 +1984,13 @@ async def wait_between_bets(page, seconds=5, add_random=True):
         print("\n[ERROR] Wait operation cancelled - likely due to browser/page closure")
         return False
 
-async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, min_time_before_match=3.5):
+async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
     """Main async function to run the Betway automation
     
     Args:
         num_matches: Number of matches to bet on (default: prompts user)
         amount_per_slip: Amount to bet per slip in Rand (default: prompts user)
         min_gap_hours: Minimum gap between matches in hours (default: 2.0)
-        min_time_before_match: Minimum hours before first match starts (default: 3.5)
     """
     # Start timer
     import time
@@ -2000,6 +2034,20 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
                         print("Please enter a positive amount.")
                 except ValueError:
                     print("Invalid input. Please enter a number.")
+        
+        # Calculate dynamic min_time_before_match based on estimated runtime
+        # Formula: (3^num_matches) * (7/3) minutes = estimated runtime
+        # Add 30 minutes buffer for safety
+        total_combinations = 3 ** num_matches
+        estimated_runtime_minutes = total_combinations * (7 / 3)  # ~2.33 min per bet
+        buffer_minutes = 30  # Safety buffer
+        min_time_before_match = math.ceil((estimated_runtime_minutes + buffer_minutes) / 60)
+        
+        print(f"\n📊 Dynamic timing calculated:")
+        print(f"   Total combinations: {total_combinations}")
+        print(f"   Estimated runtime: {estimated_runtime_minutes:.0f} minutes")
+        print(f"   Safety buffer: {buffer_minutes} minutes")
+        print(f"   ➡️  First match must start in: {min_time_before_match}+ hours")
         
         # Login with retry
         result = await retry_with_backoff(login_to_betway, max_retries=3, initial_delay=5, playwright=p)
@@ -2165,7 +2213,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
             print("🔍 STARTING SMART SCRAPING")
             print(f"{'='*60}")
             print(f"Looking for {num_matches} matches that:")
-            print(f"  1. Start 3.5+ hours from now ({min_time_before_match}+ hours)")
+            print(f"  1. Start {min_time_before_match}+ hours from now")
             print(f"  2. Are {min_gap_hours}+ hours apart from each other")
             print(f"  3. Have valid URLs captured")
             print(f"Stopping as soon as we find {num_matches} matches meeting all conditions")
@@ -2254,7 +2302,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
                                 debug_live += 1
                                 continue
                             
-                            # Check if match meets basic time requirement (3.5+ hours or future date)
+                            # Check if match meets basic time requirement (min_time_before_match hours or future date)
                             is_valid_time = False
                             
                             # Accept future dates
@@ -2392,13 +2440,13 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
                     if debug_live > 0:
                         print(f"    ❌ {debug_live} - Live matches (excluded)")
                     if debug_too_soon > 0:
-                        print(f"    ❌ {debug_too_soon} - Starts too soon (<3.5 hours)")
+                        print(f"    ❌ {debug_too_soon} - Starts too soon (<{min_time_before_match} hours)")
                     if debug_no_odds > 0:
                         print(f"    ❌ {debug_no_odds} - No odds available")
                     if debug_wrong_odds_count > 0:
                         print(f"    ❌ {debug_wrong_odds_count} - Not 1X2 market (odds ≠ 3)")
                     if debug_no_gap > 0:
-                        print(f"    ❌ {debug_no_gap} - Too close to other selected matches (<2h gap)")
+                        print(f"    ❌ {debug_no_gap} - Too close to other selected matches (<{min_gap_hours}h gap)")
                 
                 # Early termination check
                 if len(filtered_matches) >= num_matches:
@@ -2567,17 +2615,53 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0, 
         print(f"{'='*60}")
         
         total_bets = num_matches ** 3
-        avg_time_per_bet = 1
+        avg_time_per_bet = 7 / 3  # Based on: 3 combinations takes ~7 minutes
         total_time_needed = total_bets * avg_time_per_bet
+        estimated_hours = math.ceil(total_time_needed / 60)
         
         print(f"Total bets to place: {total_bets}")
-        print(f"Estimated time per bet: ~{avg_time_per_bet} minute")
-        print(f"Total time needed: ~{total_time_needed} minutes ({total_time_needed/60:.1f} hours)")
+        print(f"Estimated time per bet: ~{avg_time_per_bet:.2f} minutes")
+        print(f"Total time needed: ~{total_time_needed:.0f} minutes (~{estimated_hours} hour(s))")
         
         first_match = matches[0]
-        if first_match.get('start_time'):
-            print(f"\nFirst match: {first_match['name']} | ⏰ {first_match['start_time']}")
-            print(f"\n[OK] Time validated - safe to proceed!")
+        first_match_start_time = first_match.get('start_time', '')
+        
+        # Calculate completion time based on first match start time
+        if first_match_start_time:
+            print(f"\nFirst match: {first_match['name']} | ⏰ {first_match_start_time}")
+            
+            # Parse first match start time to calculate deadline
+            first_match_minutes = parse_match_time(first_match)
+            if first_match_minutes is not None:
+                now = datetime.now()
+                current_minutes = now.hour * 60 + now.minute
+                
+                # Handle tomorrow/future dates (parse_match_time adds 1440 for next day)
+                if first_match_minutes >= 1440:
+                    # Tomorrow or future - calculate time remaining
+                    minutes_until_match = first_match_minutes - current_minutes
+                else:
+                    minutes_until_match = first_match_minutes - current_minutes
+                
+                hours_until_match = minutes_until_match / 60
+                
+                # Calculate if we have enough time
+                if minutes_until_match > total_time_needed:
+                    buffer_minutes = minutes_until_match - total_time_needed
+                    buffer_hours = buffer_minutes / 60
+                    print(f"\n✅ TIME CHECK:")
+                    print(f"   Time until first match: {minutes_until_match:.0f} min ({hours_until_match:.1f} hours)")
+                    print(f"   Estimated script runtime: {total_time_needed:.0f} min (~{estimated_hours} hour(s))")
+                    print(f"   Buffer before match: {buffer_minutes:.0f} min ({buffer_hours:.1f} hours)")
+                    print(f"\n[OK] Time validated - safe to proceed!")
+                else:
+                    print(f"\n⚠️ TIME WARNING:")
+                    print(f"   Time until first match: {minutes_until_match:.0f} min ({hours_until_match:.1f} hours)")
+                    print(f"   Estimated script runtime: {total_time_needed:.0f} min (~{estimated_hours} hour(s))")
+                    print(f"   Script may not complete before match starts!")
+                    print(f"\n[WARNING] Proceeding anyway - watch timing carefully!")
+            else:
+                print(f"\n[OK] Time validated - safe to proceed!")
         
         print(f"{'='*60}\n")
         
