@@ -3268,6 +3268,60 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         page = result["page"]
         browser = result["browser"]
         
+        # ============================================================================
+        # BALANCE VALIDATION - Check if balance is sufficient for all bets
+        # ============================================================================
+        print(f"\n{'='*60}")
+        print("💰 BALANCE VALIDATION CHECK")
+        print(f"{'='*60}")
+        
+        current_balance = await get_current_balance(page)
+        total_required = total_combinations * amount_per_slip
+        
+        if current_balance > 0:
+            print(f"   Current balance: R{current_balance:.2f}")
+            print(f"   Total bets: {total_combinations}")
+            print(f"   Amount per bet: R{amount_per_slip:.2f}")
+            print(f"   Total required: R{total_required:.2f}")
+            
+            if current_balance >= total_required:
+                remaining_after = current_balance - total_required
+                print(f"   ✅ SUFFICIENT BALANCE")
+                print(f"   Balance after all bets: R{remaining_after:.2f}")
+            else:
+                shortfall = total_required - current_balance
+                max_possible_bets = int(current_balance / amount_per_slip)
+                print(f"   ❌ INSUFFICIENT BALANCE")
+                print(f"   Shortfall: R{shortfall:.2f}")
+                print(f"   Maximum bets possible: {max_possible_bets}")
+                print(f"{'='*60}")
+                
+                # Track the error
+                error_tracker.add_error(
+                    error_type="BET_FAILED",
+                    error_message=f"Insufficient balance: have R{current_balance:.2f}, need R{total_required:.2f} for {total_combinations} bets",
+                    context={
+                        'current_balance': current_balance,
+                        'total_required': total_required,
+                        'total_bets': total_combinations,
+                        'amount_per_bet': amount_per_slip,
+                        'shortfall': shortfall
+                    }
+                )
+                
+                print(f"\n⛔ Cannot proceed - please deposit at least R{shortfall:.2f}")
+                print(f"   Or reduce the number of matches/bet amount")
+                
+                error_tracker.display_summary()
+                error_tracker.save_to_file()
+                await browser.close()
+                return
+        else:
+            print(f"   ⚠️ Could not retrieve balance - proceeding with caution")
+            print(f"   Total required for all bets: R{total_required:.2f}")
+        
+        print(f"{'='*60}\n")
+        
         # Check for existing progress file FIRST (before scraping)
         progress_file = 'bet_progress.json'
         resume_data = None
