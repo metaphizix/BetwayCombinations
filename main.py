@@ -7,6 +7,7 @@ import json
 import random
 import math
 import gc  # Garbage collection for memory management
+import traceback  # For detailed error tracebacks
 from itertools import product
 from playwright.async_api import async_playwright, Page
 from playwright._impl._errors import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
@@ -16,6 +17,302 @@ import re
 
 # Load environment variables from .env file
 load_dotenv()
+
+
+# ============================================================================
+# ERROR TRACKING SYSTEM WITH PROBLEM DETAILS (RFC 7807/RFC 9457)
+# ============================================================================
+
+# Problem type definitions with URIs, titles, and default status codes
+PROBLEM_TYPES = {
+    'TIMEOUT': {
+        'type': 'urn:betway-automation:error:timeout',
+        'title': 'Operation Timeout',
+        'status': 504,
+        'category': 'infrastructure',
+        'recoverable': True,
+        'suggested_action': 'Browser will be restarted automatically. If persistent, check network connectivity.'
+    },
+    'BROWSER_RESTART': {
+        'type': 'urn:betway-automation:error:browser-restart',
+        'title': 'Browser Restart Required',
+        'status': 503,
+        'category': 'infrastructure',
+        'recoverable': True,
+        'suggested_action': 'Browser is being restarted. Progress is saved.'
+    },
+    'CANCELLED': {
+        'type': 'urn:betway-automation:error:cancelled',
+        'title': 'Operation Cancelled',
+        'status': 499,
+        'category': 'user_action',
+        'recoverable': False,
+        'suggested_action': 'Operation was cancelled. Re-run script to continue.'
+    },
+    'NETWORK_FAILURE': {
+        'type': 'urn:betway-automation:error:network-failure',
+        'title': 'Network Communication Failure',
+        'status': 502,
+        'category': 'network',
+        'recoverable': True,
+        'suggested_action': 'Check internet connection. Script will attempt to retry.'
+    },
+    'MEMORY_ERROR': {
+        'type': 'urn:betway-automation:error:memory-error',
+        'title': 'Playwright Memory Corruption',
+        'status': 500,
+        'category': 'infrastructure',
+        'recoverable': True,
+        'suggested_action': 'Browser memory corrupted. Fresh browser instance will be spawned.'
+    },
+    'BET_FAILED': {
+        'type': 'urn:betway-automation:error:bet-failed',
+        'title': 'Bet Placement Failed',
+        'status': 422,
+        'category': 'business_logic',
+        'recoverable': True,
+        'suggested_action': 'Bet could not be placed. Check match availability and odds.'
+    },
+    'RETRY_FAILED': {
+        'type': 'urn:betway-automation:error:retry-failed',
+        'title': 'Retry Attempt Failed',
+        'status': 422,
+        'category': 'business_logic',
+        'recoverable': True,
+        'suggested_action': 'Multiple attempts failed. Progress saved - auto-retry wrapper will restart and resume.'
+    },
+    'SESSION_EXPIRED': {
+        'type': 'urn:betway-automation:error:session-expired',
+        'title': 'Authentication Session Expired',
+        'status': 401,
+        'category': 'authentication',
+        'recoverable': True,
+        'suggested_action': 'Session expired. Re-login will be attempted automatically.'
+    },
+    'RELOGIN_FAILED': {
+        'type': 'urn:betway-automation:error:relogin-failed',
+        'title': 'Re-authentication Failed',
+        'status': 401,
+        'category': 'authentication',
+        'recoverable': True,
+        'suggested_action': 'Could not re-authenticate. Progress saved - will retry with fresh browser on restart.'
+    },
+    'EXCEPTION': {
+        'type': 'urn:betway-automation:error:exception',
+        'title': 'Unexpected Exception',
+        'status': 500,
+        'category': 'unknown',
+        'recoverable': True,
+        'suggested_action': 'Unexpected error occurred. Progress saved - auto-retry will resume from last bet.'
+    },
+    'UNHANDLED_EXCEPTION': {
+        'type': 'urn:betway-automation:error:unhandled',
+        'title': 'Unhandled Exception',
+        'status': 500,
+        'category': 'critical',
+        'recoverable': True,
+        'suggested_action': 'Unhandled exception caught. Progress saved - auto-retry wrapper will restart.'
+    }
+}
+
+
+class ProblemDetails:
+    """RFC 7807/RFC 9457 Problem Details implementation."""
+    
+    def __init__(self, error_type: str, detail: str, context: dict = None, exception: Exception = None):
+        self.timestamp = datetime.now()
+        self.error_type_key = error_type
+        
+        problem_def = PROBLEM_TYPES.get(error_type, {
+            'type': f'urn:betway-automation:error:{error_type.lower()}',
+            'title': error_type.replace('_', ' ').title(),
+            'status': 500,
+            'category': 'unknown',
+            'recoverable': False,
+            'suggested_action': 'Unknown error type. Check logs.'
+        })
+        
+        self.type = problem_def['type']
+        self.title = problem_def['title']
+        self.status = problem_def['status']
+        self.detail = detail
+        self.instance = f"urn:betway-automation:instance:{self.timestamp.strftime('%Y%m%d%H%M%S%f')}"
+        self.category = problem_def['category']
+        self.recoverable = problem_def['recoverable']
+        self.suggested_action = problem_def['suggested_action']
+        self.context = context or {}
+        
+        self.exception_info = None
+        if exception:
+            self.exception_info = {
+                'type': type(exception).__name__,
+                'message': str(exception),
+                'traceback': traceback.format_exc()
+            }
+    
+    def to_dict(self) -> dict:
+        result = {
+            'type': self.type,
+            'title': self.title,
+            'status': self.status,
+            'detail': self.detail,
+            'instance': self.instance,
+            'timestamp': self.timestamp.isoformat(),
+            'category': self.category,
+            'recoverable': self.recoverable,
+            'suggested_action': self.suggested_action,
+        }
+        if self.context:
+            result['context'] = self.context
+        if self.exception_info:
+            result['exception'] = self.exception_info
+        return result
+
+
+class ErrorTracker:
+    """Tracks errors that occur during script execution using RFC 7807 Problem Details format."""
+    
+    def __init__(self):
+        self.problems: list = []
+        self.start_time = datetime.now()
+        self.session_id = f"session-{self.start_time.strftime('%Y%m%d%H%M%S')}"
+    
+    def add_error(self, error_type: str, error_message: str, context: dict = None, exception: Exception = None):
+        """Add an error to the tracker using Problem Details format."""
+        full_context = {
+            'session_id': self.session_id,
+            'elapsed_time': str(datetime.now() - self.start_time),
+            **(context or {})
+        }
+        
+        problem = ProblemDetails(
+            error_type=error_type,
+            detail=error_message,
+            context=full_context,
+            exception=exception
+        )
+        
+        self.problems.append(problem)
+        
+        recoverable_icon = "🔄" if problem.recoverable else "⛔"
+        print(f"    📝 [PROBLEM LOGGED] {recoverable_icon} {problem.title}")
+        print(f"       └─ {error_message[:80]}{'...' if len(error_message) > 80 else ''}")
+    
+    def get_error_count(self) -> int:
+        return len(self.problems)
+    
+    def get_recoverable_errors(self) -> list:
+        return [p for p in self.problems if p.recoverable]
+    
+    def get_fatal_errors(self) -> list:
+        return [p for p in self.problems if not p.recoverable]
+    
+    def display_summary(self):
+        """Display a comprehensive summary of all errors at the end of the script."""
+        if not self.problems:
+            print(f"\n{'='*80}")
+            print("✅ PROBLEM DETAILS SUMMARY: No problems were logged during execution!")
+            print(f"   Session: {self.session_id}")
+            print(f"   Duration: {datetime.now() - self.start_time}")
+            print(f"{'='*80}\n")
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"⚠️  PROBLEM DETAILS SUMMARY (RFC 7807)")
+        print(f"{'='*80}")
+        print(f"   Session ID: {self.session_id}")
+        print(f"   Duration: {datetime.now() - self.start_time}")
+        print(f"   Total Problems: {len(self.problems)}")
+        print(f"   Recoverable: {len(self.get_recoverable_errors())} | Fatal: {len(self.get_fatal_errors())}")
+        print(f"{'='*80}")
+        
+        # Group by category
+        categories = {}
+        for problem in self.problems:
+            if problem.category not in categories:
+                categories[problem.category] = []
+            categories[problem.category].append(problem)
+        
+        category_icons = {
+            'infrastructure': '🔧', 'network': '🌐', 'authentication': '🔐',
+            'business_logic': '📋', 'user_action': '👤', 'critical': '💥', 'unknown': '❓'
+        }
+        
+        print(f"\n📊 Problems by Category:")
+        for category, probs in sorted(categories.items()):
+            icon = category_icons.get(category, '❓')
+            recoverable_count = len([p for p in probs if p.recoverable])
+            fatal_count = len(probs) - recoverable_count
+            print(f"  {icon} {category.upper()}: {len(probs)} problem(s) [🔄 {recoverable_count} recoverable, ⛔ {fatal_count} fatal]")
+        
+        # Detailed problems
+        print(f"\n{'='*80}")
+        print(f"📋 DETAILED PROBLEM LOG")
+        print(f"{'='*80}")
+        
+        for i, problem in enumerate(self.problems, 1):
+            recoverable_icon = "🔄" if problem.recoverable else "⛔"
+            print(f"\n┌{'─'*78}┐")
+            print(f"│ Problem #{i}: {problem.title[:60]:<60} {recoverable_icon} │")
+            print(f"├{'─'*78}┤")
+            print(f"│ Type: {problem.type[:70]:<70} │")
+            print(f"│ Category: {problem.category:<67} │")
+            print(f"│ Timestamp: {problem.timestamp.isoformat():<66} │")
+            print(f"├{'─'*78}┤")
+            
+            detail = problem.detail
+            print(f"│ Detail:{'':71} │")
+            for line in [detail[i:i+74] for i in range(0, len(detail), 74)]:
+                print(f"│   {line:<75} │")
+            
+            if problem.context:
+                print(f"├{'─'*78}┤")
+                print(f"│ Context:{'':70} │")
+                for key, value in list(problem.context.items())[:5]:  # Limit to 5 items
+                    str_value = str(value)[:55]
+                    print(f"│   {key[:20]:<20}: {str_value:<53} │")
+            
+            if problem.exception_info:
+                print(f"├{'─'*78}┤")
+                print(f"│ Exception: {problem.exception_info['type']:<66} │")
+                exc_msg = problem.exception_info['message'][:65]
+                print(f"│   {exc_msg:<75} │")
+            
+            print(f"├{'─'*78}┤")
+            action = problem.suggested_action[:74]
+            print(f"│ 💡 Action: {action:<67} │")
+            print(f"└{'─'*78}┘")
+        
+        print(f"\n{'='*80}")
+        print(f"End of Problem Details Summary")
+        print(f"{'='*80}\n")
+    
+    def save_to_file(self, filename: str = "error_log.json"):
+        """Save problems to a JSON file in Problem Details format."""
+        try:
+            data = {
+                'schema': 'RFC 7807 Problem Details',
+                'session_id': self.session_id,
+                'script_start': self.start_time.isoformat(),
+                'script_end': datetime.now().isoformat(),
+                'duration': str(datetime.now() - self.start_time),
+                'summary': {
+                    'total_problems': len(self.problems),
+                    'recoverable': len(self.get_recoverable_errors()),
+                    'fatal': len(self.get_fatal_errors())
+                },
+                'problems': [p.to_dict() for p in self.problems]
+            }
+            
+            with open(filename, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+            print(f"📁 Problem Details log saved to: {filename}")
+        except Exception as e:
+            print(f"⚠️ Could not save problem log: {e}")
+
+
+# Global error tracker instance
+error_tracker = ErrorTracker()
 
 
 # ============================================================================
@@ -347,12 +644,46 @@ async def retry_with_backoff(func, max_retries=3, initial_delay=5, **kwargs):
                 'timeout', 'net::', 'connection', 'network'
             ])
             
+            # Determine error type for tracking
+            if 'timeout' in error_msg:
+                error_type = 'TIMEOUT'
+            elif any(kw in error_msg for kw in ['err_name_not_resolved', 'err_connection', 'err_internet_disconnected', 'net::']):
+                error_type = 'NETWORK_FAILURE'
+            else:
+                error_type = 'EXCEPTION'
+            
             if is_network_error and attempt < max_retries - 1:
                 delay = initial_delay * (2 ** attempt)  # Exponential backoff
                 print(f"\n[NETWORK ERROR] {type(e).__name__}: {e}")
                 print(f"[RETRY] Attempt {attempt + 1}/{max_retries} - Waiting {delay}s before retry...")
+                
+                # Track the error (recoverable since we're retrying)
+                error_tracker.add_error(
+                    error_type=error_type,
+                    error_message=f"Network/timeout error during retry_with_backoff (attempt {attempt + 1}/{max_retries}): {str(e)[:150]}",
+                    context={
+                        'function': func.__name__ if hasattr(func, '__name__') else 'unknown',
+                        'attempt': attempt + 1,
+                        'max_retries': max_retries,
+                        'delay_before_retry': delay
+                    },
+                    exception=e
+                )
+                
                 await asyncio.sleep(delay)
             else:
+                # Track final failure before raising
+                error_tracker.add_error(
+                    error_type='RETRY_FAILED' if is_network_error else error_type,
+                    error_message=f"Max retries exceeded or non-recoverable error: {str(e)[:150]}",
+                    context={
+                        'function': func.__name__ if hasattr(func, '__name__') else 'unknown',
+                        'attempt': attempt + 1,
+                        'max_retries': max_retries,
+                        'is_network_error': is_network_error
+                    },
+                    exception=e
+                )
                 raise
 
 async def login_to_betway(playwright):
@@ -402,9 +733,30 @@ async def login_to_betway(playwright):
                 delay = 5 * (2 ** attempt)
                 print(f"[NETWORK ERROR] {e}")
                 print(f"[RETRY] Attempt {attempt + 1}/{max_retries} - Waiting {delay}s...")
+                
+                # Track the retry attempt
+                error_tracker.add_error(
+                    error_type="NETWORK_FAILURE" if 'timeout' not in error_msg else "TIMEOUT",
+                    error_message=f"Navigation to Betway failed (attempt {attempt + 1}/{max_retries}): {str(e)[:150]}",
+                    context={
+                        'url': 'https://new.betway.co.za/sport/soccer',
+                        'attempt': attempt + 1,
+                        'max_retries': max_retries,
+                        'delay_before_retry': delay,
+                        'phase': 'login_navigation'
+                    },
+                    exception=e
+                )
+                
                 await asyncio.sleep(delay)
             else:
                 print(f"[FATAL] Could not connect to Betway after {max_retries} attempts")
+                error_tracker.add_error(
+                    error_type="NETWORK_FAILURE",
+                    error_message=f"Could not connect to Betway after {max_retries} attempts - terminating",
+                    context={'url': 'https://new.betway.co.za/sport/soccer', 'attempts': max_retries, 'phase': 'login_navigation'},
+                    exception=e
+                )
                 await browser.close()
                 raise
     
@@ -452,10 +804,12 @@ async def login_to_betway(playwright):
     
     if not login_opened:
         print("ERROR: Could not find login button with any known selector")
-        print("Page title:", await page.title())
+        page_title = await page.title()
+        print("Page title:", page_title)
         print("Attempting to capture page state...")
         
         # Try to get all buttons on the page for debugging
+        button_debug_info = []
         try:
             all_buttons = await page.query_selector_all('button')
             print(f"\nFound {len(all_buttons)} buttons on page. First 10:")
@@ -464,11 +818,24 @@ async def login_to_betway(playwright):
                     text = await btn.inner_text()
                     classes = await btn.get_attribute('class')
                     btn_id = await btn.get_attribute('id')
-                    print(f"  Button {i+1}: text='{text[:30]}', id='{btn_id}', class='{classes[:50] if classes else ''}'")
+                    btn_info = f"text='{text[:30]}', id='{btn_id}'"
+                    button_debug_info.append(btn_info)
+                    print(f"  Button {i+1}: {btn_info}, class='{classes[:50] if classes else ''}'")
                 except:
                     pass
         except:
             pass
+        
+        error_tracker.add_error(
+            error_type="SESSION_EXPIRED",
+            error_message="Could not find login button with any known selector - page structure may have changed",
+            context={
+                'page_url': page.url,
+                'page_title': page_title,
+                'buttons_found': len(button_debug_info),
+                'phase': 'login_modal_open'
+            }
+        )
         
         await browser.close()
         return None
@@ -516,6 +883,16 @@ async def login_to_betway(playwright):
     
     if not login_successful:
         print("! Could not verify login. Please check the browser.")
+        error_tracker.add_error(
+            error_type="SESSION_EXPIRED",
+            error_message="Could not verify login after authentication attempt - balance element not found",
+            context={
+                'max_attempts': max_attempts,
+                'url': page.url,
+                'phase': 'login_verification',
+                'possible_causes': ['Invalid credentials', 'Page structure changed', 'Slow page load', 'CAPTCHA required']
+            }
+        )
         await browser.close()
         return None
     
@@ -628,12 +1005,34 @@ async def restart_browser_fresh(playwright, old_browser=None, old_page=None):
             print("   All Playwright state reset")
             print("   Ready to continue betting")
             print(f"{'='*60}\n")
+            
+            # Track the successful browser restart
+            error_tracker.add_error(
+                error_type='BROWSER_RESTART',
+                error_message='Browser was restarted successfully to prevent memory corruption',
+                context={
+                    'restart_reason': 'Memory management / Playwright state reset',
+                    'status': 'successful'
+                }
+            )
+            
             return result
         else:
             print("  ❌ Failed to login with new browser")
+            error_tracker.add_error(
+                error_type='BROWSER_RESTART',
+                error_message='Browser restart failed - could not login with new browser',
+                context={'status': 'login_failed'}
+            )
             return None
     except Exception as e:
         print(f"  ❌ Error creating new browser: {e}")
+        error_tracker.add_error(
+            error_type='BROWSER_RESTART',
+            error_message=f'Browser restart failed with exception: {str(e)[:150]}',
+            context={'status': 'exception'},
+            exception=e
+        )
         return None
 
 
@@ -668,12 +1067,24 @@ async def check_and_relogin(page: Page, browser) -> bool:
         # If we got here, we need to re-login
         print("🔄 [RE-LOGIN] Attempting to re-authenticate...")
         
+        # Track session expiry
+        error_tracker.add_error(
+            error_type='SESSION_EXPIRED',
+            error_message='Session expired - detected logged out state, attempting re-login',
+            context={'action': 'attempting_relogin'}
+        )
+        
         # Get credentials from env
         username = os.getenv('BETWAY_USERNAME')
         password = os.getenv('BETWAY_PASSWORD')
         
         if not username or not password:
             print("❌ [RE-LOGIN FAILED] Credentials not found in .env")
+            error_tracker.add_error(
+                error_type='RELOGIN_FAILED',
+                error_message='Re-login failed - credentials not found in .env file',
+                context={'reason': 'missing_credentials'}
+            )
             return False
         
         # Navigate to the main page to trigger login
@@ -682,6 +1093,12 @@ async def check_and_relogin(page: Page, browser) -> bool:
             await page.wait_for_timeout(2000)
         except Exception as e:
             print(f"❌ [RE-LOGIN FAILED] Could not navigate: {e}")
+            error_tracker.add_error(
+                error_type='RELOGIN_FAILED',
+                error_message=f'Re-login failed - navigation error: {str(e)[:150]}',
+                context={'reason': 'navigation_failed'},
+                exception=e
+            )
             return False
         
         # Try to find and click login button
@@ -714,6 +1131,11 @@ async def check_and_relogin(page: Page, browser) -> bool:
             except:
                 pass
             print("❌ [RE-LOGIN FAILED] Could not find login button")
+            error_tracker.add_error(
+                error_type='RELOGIN_FAILED',
+                error_message='Re-login failed - could not find login button',
+                context={'reason': 'login_button_not_found'}
+            )
             return False
         
         # Wait for login modal
@@ -731,6 +1153,12 @@ async def check_and_relogin(page: Page, browser) -> bool:
             print("  ✓ Credentials submitted")
         except Exception as e:
             print(f"❌ [RE-LOGIN FAILED] Could not fill credentials: {e}")
+            error_tracker.add_error(
+                error_type='RELOGIN_FAILED',
+                error_message=f'Re-login failed - could not fill credentials: {str(e)[:150]}',
+                context={'reason': 'credential_fill_failed'},
+                exception=e
+            )
             return False
         
         # Wait and verify login
@@ -753,10 +1181,21 @@ async def check_and_relogin(page: Page, browser) -> bool:
                     await page.wait_for_timeout(1000)
         
         print("❌ [RE-LOGIN FAILED] Could not verify login after re-authentication")
+        error_tracker.add_error(
+            error_type='RELOGIN_FAILED',
+            error_message='Re-login failed - could not verify login after re-authentication',
+            context={'reason': 'verification_failed'}
+        )
         return False
         
     except Exception as e:
         print(f"❌ [RE-LOGIN ERROR] {e}")
+        error_tracker.add_error(
+            error_type='RELOGIN_FAILED',
+            error_message=f'Re-login failed with exception: {str(e)[:150]}',
+            context={'reason': 'exception'},
+            exception=e
+        )
         return False
 
 async def close_all_modals(page: Page, max_attempts=3):
@@ -1012,6 +1451,16 @@ async def scrape_matches(page: Page, num_matches: int):
         
     except Exception as e:
         print(f"Error scraping matches: {e}")
+        error_tracker.add_error(
+            error_type="EXCEPTION",
+            error_message=f"Error during match scraping: {str(e)[:150]}",
+            context={
+                'matches_found_so_far': len(matches),
+                'current_page': current_page,
+                'phase': 'match_scraping'
+            },
+            exception=e
+        )
     
     return matches
 
@@ -2395,7 +2844,8 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
 async def wait_between_bets(page, seconds=5, add_random=True):
     """Wait for specified seconds between bets with optional randomization
     
-    Handles page/browser closures gracefully by catching CancelledError
+    Handles page/browser closures gracefully by catching CancelledError.
+    All interruptions and timeouts are logged to the error tracker.
     """
     base_seconds = seconds
     
@@ -2413,14 +2863,51 @@ async def wait_between_bets(page, seconds=5, add_random=True):
     try:
         for i in range(chunks):
             # Check if page is still valid before sleeping
-            if page.is_closed():
-                print("[ERROR] Page was closed during wait!")
+            try:
+                if page.is_closed():
+                    print("[ERROR] Page was closed during wait!")
+                    error_tracker.add_error(
+                        error_type='BROWSER_RESTART',
+                        error_message='Wait interrupted - page was closed during wait period (may require browser restart)',
+                        context={
+                            'elapsed_seconds': (i) * chunk_size,
+                            'total_seconds': total_seconds,
+                            'recovery_action': 'Browser will be restarted on next bet attempt'
+                        }
+                    )
+                    return False
+            except Exception as page_check_error:
+                # Page object itself may be corrupted
+                error_tracker.add_error(
+                    error_type='MEMORY_ERROR',
+                    error_message=f'Page object corrupted during wait: {str(page_check_error)[:100]}',
+                    context={'elapsed_seconds': (i) * chunk_size, 'total_seconds': total_seconds},
+                    exception=page_check_error
+                )
                 return False
             
             try:
                 await asyncio.sleep(chunk_size)
             except asyncio.CancelledError:
                 print(f"\n[WARNING] Wait interrupted at {(i + 1) * chunk_size}s - page/browser may have been closed")
+                error_tracker.add_error(
+                    error_type='CANCELLED',
+                    error_message=f'Wait interrupted (CancelledError) at {(i + 1) * chunk_size}s - page/browser may have been closed',
+                    context={
+                        'elapsed_seconds': (i + 1) * chunk_size,
+                        'total_seconds': total_seconds,
+                        'recovery_action': 'Script will attempt to continue or restart'
+                    }
+                )
+                return False
+            except asyncio.TimeoutError as timeout_err:
+                print(f"\n[ERROR] Timeout during wait at {(i + 1) * chunk_size}s")
+                error_tracker.add_error(
+                    error_type='TIMEOUT',
+                    error_message=f'Timeout during wait operation at {(i + 1) * chunk_size}s',
+                    context={'elapsed_seconds': (i + 1) * chunk_size, 'total_seconds': total_seconds},
+                    exception=timeout_err
+                )
                 return False
             
             elapsed = (i + 1) * chunk_size
@@ -2434,6 +2921,19 @@ async def wait_between_bets(page, seconds=5, add_random=True):
                 await asyncio.sleep(remainder)
             except asyncio.CancelledError:
                 print(f"\n[WARNING] Wait interrupted during final {remainder}s - page/browser may have been closed")
+                error_tracker.add_error(
+                    error_type='CANCELLED',
+                    error_message=f'Wait interrupted (CancelledError) during final {remainder}s - page/browser may have been closed',
+                    context={'elapsed_seconds': total_seconds - remainder, 'total_seconds': total_seconds}
+                )
+                return False
+            except asyncio.TimeoutError as timeout_err:
+                error_tracker.add_error(
+                    error_type='TIMEOUT',
+                    error_message=f'Timeout during final wait period',
+                    context={'elapsed_seconds': total_seconds - remainder, 'total_seconds': total_seconds},
+                    exception=timeout_err
+                )
                 return False
         
         print("[OK] Wait complete!\n")
@@ -2441,6 +2941,20 @@ async def wait_between_bets(page, seconds=5, add_random=True):
         
     except asyncio.CancelledError:
         print("\n[ERROR] Wait operation cancelled - likely due to browser/page closure")
+        error_tracker.add_error(
+            error_type='CANCELLED',
+            error_message='Wait operation cancelled - likely due to browser/page closure',
+            context={'total_seconds': total_seconds, 'recovery_action': 'Auto-retry wrapper will restart script'}
+        )
+        return False
+    except Exception as unexpected_error:
+        print(f"\n[ERROR] Unexpected error during wait: {unexpected_error}")
+        error_tracker.add_error(
+            error_type='EXCEPTION',
+            error_message=f'Unexpected error during wait: {str(unexpected_error)[:150]}',
+            context={'total_seconds': total_seconds},
+            exception=unexpected_error
+        )
         return False
 
 async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
@@ -2568,19 +3082,57 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         print(f"  Anti-Detection: 5s waits + random delays + browser restarts")
         print("="*60)
         
-        # Navigate to upcoming matches page
-        print("\nNavigating to upcoming matches page...")
+        # Define the scraping URLs - highlights first, then upcoming as fallback
+        SCRAPING_URLS = [
+            {
+                'url': 'https://new.betway.co.za/sport/soccer/highlights',
+                'name': 'Highlights',
+                'description': 'Featured/popular matches'
+            },
+            {
+                'url': 'https://new.betway.co.za/sport/soccer/upcoming',
+                'name': 'Upcoming',
+                'description': 'All upcoming matches'
+            }
+        ]
+        
+        # Navigate to highlights page first (primary source)
+        print("\nNavigating to soccer highlights page (primary source)...")
         try:
-            await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=30000)
+            await page.goto(SCRAPING_URLS[0]['url'], wait_until='domcontentloaded', timeout=30000)
             await page.wait_for_timeout(3000)
             try:
                 await close_all_modals(page)
             except:
                 pass  # Non-critical if modal closing fails
+            print(f"[OK] Loaded {SCRAPING_URLS[0]['name']} page - {SCRAPING_URLS[0]['description']}")
         except Exception as nav_error:
-            print(f"[ERROR] Failed to navigate to matches page: {nav_error}")
-            await browser.close()
-            return
+            print(f"[WARNING] Failed to navigate to highlights page: {nav_error}")
+            print("[ACTION] Trying upcoming page as fallback...")
+            try:
+                await page.goto(SCRAPING_URLS[1]['url'], wait_until='domcontentloaded', timeout=30000)
+                await page.wait_for_timeout(3000)
+                try:
+                    await close_all_modals(page)
+                except:
+                    pass
+                print(f"[OK] Loaded {SCRAPING_URLS[1]['name']} page as fallback")
+            except Exception as fallback_error:
+                print(f"[ERROR] Failed to navigate to both pages: {fallback_error}")
+                error_tracker.add_error(
+                    error_type="NETWORK_FAILURE" if 'timeout' in str(fallback_error).lower() else "EXCEPTION",
+                    error_message=f"Failed to navigate to both highlights and upcoming pages: {str(fallback_error)[:150]}",
+                    context={
+                        'highlights_url': SCRAPING_URLS[0]['url'],
+                        'upcoming_url': SCRAPING_URLS[1]['url'],
+                        'phase': 'initial_navigation'
+                    },
+                    exception=fallback_error
+                )
+                error_tracker.display_summary()
+                error_tracker.save_to_file()
+                await browser.close()
+                return
         
         # Define parse_match_time function early (needed for both resume and fresh scraping)
         def parse_match_time(match):
@@ -2666,56 +3218,109 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             print(f"Looking for matches around: {target_hour:02d}:{target_minute:02d} or later")
             
             # ============================================================================
-            # SMART SCRAPING - Only scrape matches that meet conditions, stop when done
+            # SMART SCRAPING - Scrape from highlights first, then upcoming if needed
+            # Matches can be mixed from both sources as long as they meet filter conditions
+            # NOTE: Highlights page sorts matches by TIME (not league order) before selection
             # ============================================================================
             print(f"\n{'='*60}")
-            print("🔍 STARTING SMART SCRAPING")
+            print("🔍 STARTING SMART SCRAPING (HIGHLIGHTS → UPCOMING)")
             print(f"{'='*60}")
-            print(f"Looking for {num_matches} matches that:")
-            print(f"  1. Start {min_time_before_match}+ hours from now")
-            print(f"  2. Are {min_gap_hours}+ hours apart from each other")
-            print(f"  3. Have valid URLs captured")
+            print(f"Scraping order:")
+            print(f"  1️⃣  Highlights page (featured matches) - PRIMARY")
+            print(f"      ⏰ Matches sorted by: TIME first, then HIGHEST ODDS")
+            print(f"      📊 For same time slot: match with highest odds is selected first")
+            print(f"  2️⃣  Upcoming page (all matches) - FALLBACK if not enough found")
+            print(f"\nLooking for {num_matches} matches that:")
+            print(f"  ✓ Start {min_time_before_match}+ hours from now")
+            print(f"  ✓ Are {min_gap_hours}+ hours apart from each other")
+            print(f"  ✓ Have valid URLs captured")
+            print(f"  ✓ Can be mixed from both sources")
             print(f"Stopping as soon as we find {num_matches} matches meeting all conditions")
             print(f"{'='*60}\n")
         
             min_gap_minutes = int(min_gap_hours * 60)
-            max_pages = 20
-            current_page = 0
+            max_pages_per_source = 20
             
-            while len(filtered_matches) < num_matches and current_page < max_pages:
-                current_page += 1
-                print(f"\n📄 Scraping page {current_page}/{max_pages}...")
+            # Track all processed match names across all sources
+            all_processed_match_names = set()
+            
+            # Iterate through scraping sources: highlights first, then upcoming
+            for source_index, source in enumerate(SCRAPING_URLS):
+                # Skip if we already have enough matches
+                if len(filtered_matches) >= num_matches:
+                    break
                 
-                await close_all_modals(page)
-                await page.wait_for_timeout(500)
+                source_url = source['url']
+                source_name = source['name']
+                source_desc = source['description']
                 
-                # Scroll to load content
-                for _ in range(3):
-                    await page.evaluate('window.scrollBy(0, 500)')
-                    await page.wait_for_timeout(200)
+                # Check if this is the highlights page (needs time-based sorting)
+                is_highlights_page = 'highlights' in source_url.lower()
                 
-                match_containers = await page.query_selector_all('div[data-v-206d232b].relative.grid.grid-cols-12')
-                print(f"  Found {len(match_containers)} match containers on page {current_page}")
+                print(f"\n{'='*60}")
+                print(f"📌 SOURCE {source_index + 1}/{len(SCRAPING_URLS)}: {source_name.upper()}")
+                print(f"   {source_desc}")
+                print(f"   URL: {source_url}")
+                if is_highlights_page:
+                    print(f"   ⏰ TIME-SORTED MODE: Matches sorted by start time, then by highest odds")
+                print(f"   Matches found so far: {len(filtered_matches)}/{num_matches}")
+                print(f"{'='*60}")
                 
-                # Track which matches we've already checked on this page (by name)
-                processed_match_names = set()
+                # Navigate to this source
+                try:
+                    await page.goto(source_url, wait_until='domcontentloaded', timeout=30000)
+                    await page.wait_for_timeout(2000)
+                    await close_all_modals(page)
+                except Exception as nav_error:
+                    print(f"  ⚠️ Failed to navigate to {source_name}: {nav_error}")
+                    continue  # Try next source
                 
-                # Debug counters
-                debug_no_teams = 0
-                debug_no_time = 0
-                debug_live = 0
-                debug_too_soon = 0
-                debug_no_odds = 0
-                debug_wrong_odds_count = 0
-                debug_no_gap = 0
+                current_page = 0
                 
-                # Keep processing containers until we've checked them all or found enough matches
-                while True:
-                    # Process each match container
-                    found_match_on_page = False
-                    
-                    for i, container in enumerate(match_containers):
+                # For highlights page: collect ALL candidate matches first, then sort by time
+                # For upcoming page: process normally (already sorted by time)
+                candidate_matches = [] if is_highlights_page else None
+                
+                while (is_highlights_page or len(filtered_matches) < num_matches) and current_page < max_pages_per_source:
+                    # For highlights, we need to scan all pages to get all candidates
+                    # For upcoming, we can stop early when we have enough matches
+                    if is_highlights_page:
+                        # Continue until we've scanned enough pages or hit max
+                        pass
+                    else:
                         if len(filtered_matches) >= num_matches:
+                            break
+                    
+                    current_page += 1
+                    print(f"\n📄 [{source_name}] Scraping page {current_page}/{max_pages_per_source}...")
+                    
+                    await close_all_modals(page)
+                    await page.wait_for_timeout(500)
+                    
+                    # Scroll to load content
+                    for _ in range(3):
+                        await page.evaluate('window.scrollBy(0, 500)')
+                        await page.wait_for_timeout(200)
+                    
+                    match_containers = await page.query_selector_all('div[data-v-206d232b].relative.grid.grid-cols-12')
+                    print(f"  Found {len(match_containers)} match containers on page {current_page}")
+                    
+                    # Debug counters (reset per page)
+                    debug_no_teams = 0
+                    debug_no_time = 0
+                    debug_live = 0
+                    debug_too_soon = 0
+                    debug_no_odds = 0
+                    debug_wrong_odds_count = 0
+                    debug_no_gap = 0
+                    debug_duplicate = 0
+                    debug_no_url = 0
+                    matches_added_this_page = 0
+                    
+                    # Process each match container
+                    for i, container in enumerate(match_containers):
+                        # For non-highlights pages, check if we have enough matches
+                        if not is_highlights_page and len(filtered_matches) >= num_matches:
                             print(f"\n✅ Found {num_matches} matches - stopping scraping early")
                             break
                         
@@ -2730,12 +3335,13 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                             team2 = await team_elements[1].inner_text()
                             match_name = f"{team1} vs {team2}"
                             
-                            # Skip if already processed this match
-                            if match_name in processed_match_names:
+                            # Skip if already processed this match (across ALL sources)
+                            if match_name in all_processed_match_names:
+                                debug_duplicate += 1
                                 continue
                             
-                            # Mark as processed
-                            processed_match_names.add(match_name)
+                            # Mark as processed globally
+                            all_processed_match_names.add(match_name)
                             
                             # Extract start time
                             start_time_text = None
@@ -2807,10 +3413,27 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                 debug_no_odds += 1
                             
                             # CRITICAL: Only accept matches with exactly 3 odds (1X2 market)
-                            # This filters for 1X2 matches without checking text headers
                             if len(odds) != 3:
                                 debug_wrong_odds_count += 1
-                                continue  # Skip matches without 1X2 market
+                                continue
+                            
+                            # Try to capture URL for this match
+                            match_url = None
+                            try:
+                                link_element = await container.query_selector('a[href*="/event/soccer/"]')
+                                if link_element:
+                                    relative_url = await link_element.get_attribute('href')
+                                    if relative_url:
+                                        if relative_url.startswith('/'):
+                                            match_url = f"https://new.betway.co.za{relative_url}"
+                                        else:
+                                            match_url = relative_url
+                            except Exception as href_error:
+                                print(f"  ⚠️ Failed to extract href: {href_error}")
+                            
+                            if not match_url:
+                                debug_no_url += 1
+                                continue
                             
                             # Create match object
                             match = {
@@ -2819,79 +3442,52 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                 'team2': team2,
                                 'odds': odds[:3],
                                 'start_time': start_time_text,
-                                'url': None
+                                'url': match_url,
+                                'source': source_name
                             }
                             
-                            # Check if this match is at least 2 hours apart from all already selected matches
-                            current_time = parse_match_time(match)
-                            if current_time is None:
-                                continue
-                            
-                            is_far_enough = True
-                            
-                            for selected_match in filtered_matches:
-                                selected_time = parse_match_time(selected_match)
-                                if selected_time is not None:
-                                    time_diff = abs(current_time - selected_time)
-                                    if time_diff < min_gap_minutes:
-                                        is_far_enough = False
-                                        break
-                            
-                            if not is_far_enough:
-                                debug_no_gap += 1
-                                continue
-                            
-                            # Try to capture URL for this match - extract from href attribute instead of navigating
-                            try:
-                                # Find the <a> element that contains the match URL
-                                link_element = await container.query_selector('a[href*="/event/soccer/"]')
-                                if link_element:
-                                    try:
-                                        # Extract href attribute directly - no navigation needed!
-                                        relative_url = await link_element.get_attribute('href')
-                                        if relative_url:
-                                            # Convert relative URL to absolute
-                                            if relative_url.startswith('/'):
-                                                match_url = f"https://new.betway.co.za{relative_url}"
-                                            else:
-                                                match_url = relative_url
-                                        else:
-                                            match_url = None
-                                    except Exception as href_error:
-                                        print(f"  ⚠️ Failed to extract href: {href_error}")
-                                        match_url = None
-                                    
-                                    # No need for page.go_back() or close_all_modals() anymore!
-                                    match['url'] = match_url
-                                    filtered_matches.append(match)
-                                    print(f"  ✓ Match {len(filtered_matches)}/{num_matches}: '{match_name}' ({start_time_text}) [URL cached]")
-                                    
-                                    # No need to re-query containers since we didn't navigate away!
-                                    found_match_on_page = True
-                                    
-                                    if len(filtered_matches) >= num_matches:
-                                        break  # We have enough matches
-                                        
-                                else:
-                                    print(f"  ⚠️ Could not find link element for '{match_name}'")
-                            except Exception as e:
-                                print(f"  ⚠️ Could not capture URL for '{match_name}': {e}")
-                                continue
+                            # For highlights page: add to candidates (will sort later)
+                            # For upcoming page: apply gap filter immediately
+                            if is_highlights_page:
+                                candidate_matches.append(match)
+                                matches_added_this_page += 1
+                            else:
+                                # Check time gap for non-highlights pages
+                                current_time = parse_match_time(match)
+                                if current_time is None:
+                                    continue
+                                
+                                is_far_enough = True
+                                for selected_match in filtered_matches:
+                                    selected_time = parse_match_time(selected_match)
+                                    if selected_time is not None:
+                                        time_diff = abs(current_time - selected_time)
+                                        if time_diff < min_gap_minutes:
+                                            is_far_enough = False
+                                            break
+                                
+                                if not is_far_enough:
+                                    debug_no_gap += 1
+                                    continue
+                                
+                                filtered_matches.append(match)
+                                matches_added_this_page += 1
+                                print(f"  ✓ Match {len(filtered_matches)}/{num_matches}: '{match_name}' ({start_time_text}) [from {source_name}]")
+                                
+                                if len(filtered_matches) >= num_matches:
+                                    break
                             
                         except Exception as e:
                             continue
                     
-                    # If we didn't find a match, we've processed all containers
-                    if not found_match_on_page:
-                        break
+                    # Print debug info for this page
+                    print(f"  📊 Page {current_page} summary for [{source_name}]:")
+                    if is_highlights_page:
+                        print(f"    ✓ {matches_added_this_page} candidates added (will sort by time later)")
+                        print(f"    Total candidates so far: {len(candidate_matches)}")
+                    else:
+                        print(f"    ✓ {matches_added_this_page} matches selected")
                     
-                    # If we have enough matches, stop
-                    if len(filtered_matches) >= num_matches:
-                        break
-                
-                # Print debug info for this page
-                if len(filtered_matches) < num_matches:
-                    print(f"  📊 Debug - why matches were skipped on page {current_page}:")
                     if debug_no_teams > 0:
                         print(f"    ❌ {debug_no_teams} - Missing team names")
                     if debug_no_time > 0:
@@ -2904,62 +3500,142 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         print(f"    ❌ {debug_no_odds} - No odds available")
                     if debug_wrong_odds_count > 0:
                         print(f"    ❌ {debug_wrong_odds_count} - Not 1X2 market (odds ≠ 3)")
-                    if debug_no_gap > 0:
+                    if debug_no_url > 0:
+                        print(f"    ❌ {debug_no_url} - Could not extract URL")
+                    if not is_highlights_page and debug_no_gap > 0:
                         print(f"    ❌ {debug_no_gap} - Too close to other selected matches (<{min_gap_hours}h gap)")
-                
-                # Early termination check
-                if len(filtered_matches) >= num_matches:
-                    break
-                
-                # Click Next button if we need more matches and haven't reached max pages
-                if len(filtered_matches) < num_matches and current_page < max_pages:
-                    print(f"  Need {num_matches - len(filtered_matches)} more match(es) - moving to page {current_page + 1}...")
-                    try:
-                        # Try multiple Next button selectors
-                        next_button = None
-                        next_selectors = [
-                            'button[aria-label="Go to next page"]',
-                            'button.p-ripple.p-element.p-paginator-next',
-                            'button:has-text("Next")',
-                            'button[class*="next"]'
-                        ]
-                        
-                        for selector in next_selectors:
-                            try:
-                                btn = await page.query_selector(selector)
-                                if btn:
-                                    is_disabled = await btn.get_attribute('disabled')
-                                    if not is_disabled:
-                                        next_button = btn
-                                        break
-                            except:
-                                continue
-                        
-                        if next_button:
-                            print(f"  Clicking 'Next' to load page {current_page + 1}...")
-                            await next_button.click()
-                            await page.wait_for_timeout(1500)
-                        else:
-                            # No next button found or all disabled - we've reached the end
-                            print(f"  No 'Next' button available - reached last page")
-                            break  # Exit outer while loop - no more pages
+                    if debug_duplicate > 0:
+                        print(f"    ❌ {debug_duplicate} - Duplicate (already seen)")
+                    
+                    # Check if we should continue to next page
+                    if not is_highlights_page and len(filtered_matches) >= num_matches:
+                        break
+                    
+                    # Click Next button if needed
+                    if current_page < max_pages_per_source:
+                        try:
+                            next_button = None
+                            next_selectors = [
+                                'button[aria-label="Go to next page"]',
+                                'button.p-ripple.p-element.p-paginator-next',
+                                'button:has-text("Next")',
+                                'button[class*="next"]'
+                            ]
                             
-                    except Exception as e:
-                        print(f"  ⚠️ Error clicking Next button: {e}")
-                        # Don't break - try to continue anyway by reloading or continuing
-                        print(f"  Attempting to continue to page {current_page + 1} anyway...")
-                        # The outer loop will continue and try to get containers on what might be the same page
-        
+                            for selector in next_selectors:
+                                try:
+                                    btn = await page.query_selector(selector)
+                                    if btn:
+                                        is_disabled = await btn.get_attribute('disabled')
+                                        if not is_disabled:
+                                            next_button = btn
+                                            break
+                                except:
+                                    continue
+                            
+                            if next_button:
+                                print(f"  Clicking 'Next' to load [{source_name}] page {current_page + 1}...")
+                                await next_button.click()
+                                await page.wait_for_timeout(1500)
+                            else:
+                                print(f"  No 'Next' button available on {source_name} - end of pages")
+                                break
+                                
+                        except Exception as e:
+                            print(f"  ⚠️ Error clicking Next button on {source_name}: {e}")
+                            break
+                
+                # For highlights page: NOW sort candidates by time and apply gap filtering
+                if is_highlights_page and candidate_matches:
+                    print(f"\n  {'='*50}")
+                    print(f"  ⏰ SORTING {len(candidate_matches)} CANDIDATES BY TIME, THEN BY HIGHEST ODDS")
+                    print(f"  {'='*50}")
+                    print(f"  Priority 1: Start time (earliest first)")
+                    print(f"  Priority 2: Highest odds for same time slot (max of 1/X/2)")
+                    
+                    # Helper function to get the maximum odd value from a match's odds
+                    def get_max_odd(match):
+                        odds = match.get('odds', [])
+                        if len(odds) >= 3:
+                            return max(odds)  # Return highest odd value
+                        return 0  # No odds available
+                    
+                    # Sort candidates by:
+                    # 1. Parsed time (ascending - earliest first)
+                    # 2. Maximum odd value (descending - highest odds first for same time)
+                    candidate_matches.sort(key=lambda m: (parse_match_time(m) or 999999, -get_max_odd(m)))
+                    
+                    print(f"  Sorted order (by time, then highest odds):")
+                    for idx, cm in enumerate(candidate_matches[:10], 1):  # Show first 10
+                        odds = cm.get('odds', [])
+                        max_odd = max(odds) if len(odds) >= 3 else 0
+                        odds_str = f"[1:{odds[0]:.2f} X:{odds[1]:.2f} 2:{odds[2]:.2f}]" if len(odds) >= 3 else "[no odds]"
+                        print(f"    {idx}. {cm['name']} - {cm.get('start_time', 'Unknown')} | Max odd: {max_odd:.2f} {odds_str}")
+                    if len(candidate_matches) > 10:
+                        print(f"    ... and {len(candidate_matches) - 10} more candidates")
+                    
+                    # Now apply gap filtering on sorted candidates
+                    print(f"\n  Applying {min_gap_hours}h gap filter on time-sorted matches...")
+                    
+                    for match in candidate_matches:
+                        if len(filtered_matches) >= num_matches:
+                            break
+                        
+                        current_time = parse_match_time(match)
+                        if current_time is None:
+                            continue
+                        
+                        is_far_enough = True
+                        for selected_match in filtered_matches:
+                            selected_time = parse_match_time(selected_match)
+                            if selected_time is not None:
+                                time_diff = abs(current_time - selected_time)
+                                if time_diff < min_gap_minutes:
+                                    is_far_enough = False
+                                    break
+                        
+                        if is_far_enough:
+                            filtered_matches.append(match)
+                            print(f"  ✓ Selected {len(filtered_matches)}/{num_matches}: '{match['name']}' ({match.get('start_time', 'Unknown')}) [from {source_name}]")
+                
+                # Summary for this source
+                matches_from_source = len([m for m in filtered_matches if m.get('source') == source_name])
+                print(f"\n  📋 [{source_name}] Summary: Found {matches_from_source} matches from this source")
+            
+            # Count matches by source for final summary
+            source_counts = {}
+            for m in filtered_matches:
+                src = m.get('source', 'Unknown')
+                source_counts[src] = source_counts.get(src, 0) + 1
+            
             print(f"\n{'='*60}")
-            print(f"✅ SMART SCRAPING COMPLETE")
+            print(f"✅ SMART SCRAPING COMPLETE (HIGHLIGHTS → UPCOMING)")
             print(f"{'='*60}")
             print(f"Found {len(filtered_matches)}/{num_matches} matches meeting all conditions")
-            print(f"Scraped {current_page} pages")
+            print(f"Match sources breakdown:")
+            for src, count in source_counts.items():
+                print(f"  - {src}: {count} match(es)")
             print(f"{'='*60}\n")
             
             if len(filtered_matches) < num_matches:
                 print(f"\n[ERROR] Could not find {num_matches} matches with {min_gap_hours}+ hour gaps")
-                print(f"Scraped {current_page} pages, found {len(filtered_matches)} matches meeting conditions")
+                print(f"Searched both Highlights and Upcoming pages")
+                print(f"Found {len(filtered_matches)} matches meeting conditions")
+                
+                error_tracker.add_error(
+                    error_type="BET_FAILED",
+                    error_message=f"Could not find {num_matches} matches with {min_gap_hours}+ hour gaps from highlights or upcoming pages",
+                    context={
+                        'required_matches': num_matches,
+                        'found_matches': len(filtered_matches),
+                        'min_gap_hours': min_gap_hours,
+                        'sources_searched': [s['name'] for s in SCRAPING_URLS]
+                    }
+                )
+                
+                error_tracker.display_summary()
+                error_tracker.save_to_file()
+                
                 await browser.close()
                 return
         
@@ -2970,13 +3646,16 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         print(f"{'='*60}")
         for i, m in enumerate(matches, 1):
             start_time = m.get('start_time', 'Unknown time')
+            source = m.get('source', 'Unknown')
             odds = m.get('odds', [])
             odds_str = f"1:{odds[0]:.2f} X:{odds[1]:.2f} 2:{odds[2]:.2f}" if len(odds) >= 3 else str(odds)
             print(f"  {i}. {m['name']}")
             print(f"     ⏰ Start: {start_time}")
             print(f"     📊 Odds: {odds_str}")
+            print(f"     📌 Source: {source}")
         print(f"{'='*60}")
         print(f"All matches are {min_gap_hours}+ hours apart from each other")
+        print(f"Matches can be from Highlights and/or Upcoming pages")
         print(f"{'='*60}\n")
         
         # CRITICAL: Validate all matches have cached URLs before proceeding
@@ -3005,6 +3684,19 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             print(f"This usually happens if the match page failed to load during scraping.")
             print(f"Please try running the script again.")
             print(f"{'='*60}")
+            
+            error_tracker.add_error(
+                error_type="BET_FAILED",
+                error_message=f"{len(missing_urls)} match(es) missing cached URLs - cannot proceed with betting",
+                context={
+                    'missing_urls': missing_urls,
+                    'total_matches': len(matches),
+                    'phase': 'url_validation'
+                }
+            )
+            error_tracker.display_summary()
+            error_tracker.save_to_file()
+            
             await browser.close()
             return
         
@@ -3046,6 +3738,19 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             print(f"VALIDATION FAILED: Matches are NOT {min_gap_hours}+ hours apart!")
             print("Aborting to prevent incorrect bets.")
             print(f"{'='*60}")
+            
+            error_tracker.add_error(
+                error_type="BET_FAILED",
+                error_message=f"Match time gap validation failed - matches are NOT {min_gap_hours}+ hours apart",
+                context={
+                    'required_gap_hours': min_gap_hours,
+                    'num_matches': len(matches),
+                    'phase': 'time_gap_validation'
+                }
+            )
+            error_tracker.display_summary()
+            error_tracker.save_to_file()
+            
             await browser.close()
             return
         
@@ -3214,9 +3919,28 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         print(f"  ✓ [CACHED] Selector stored for reuse across all {len(bet_slips)} bets\n")
                     else:
                         print(f"  ❌ ERROR: Could not find working selector\n")
+                        error_tracker.add_error(
+                            error_type="BET_FAILED",
+                            error_message=f"Could not find outcome button selector for match: {match['name']}",
+                            context={
+                                'match_url': match_url,
+                                'match_name': match['name'],
+                                'phase': 'pre_caching'
+                            }
+                        )
                         
                 except Exception as e:
                     print(f"  ❌ ERROR caching buttons: {e}\n")
+                    error_tracker.add_error(
+                        error_type="EXCEPTION",
+                        error_message=f"Exception during outcome button caching for match: {match['name']}",
+                        context={
+                            'match_url': match_url,
+                            'match_name': match['name'],
+                            'phase': 'pre_caching'
+                        },
+                        exception=e
+                    )
         
         print(f"{'='*60}")
         print(f"✅ PRE-CACHING COMPLETE")
@@ -3303,6 +4027,17 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             if not is_logged_in:
                 print(f"\n❌ [FATAL] Could not verify/restore login - stopping bet placement")
                 print(f"[INFO] Completed {successful} bets before login failure")
+                
+                error_tracker.add_error(
+                    error_type="SESSION_EXPIRED",
+                    error_message=f"Could not verify/restore login - stopping after {successful} successful bets",
+                    context={
+                        'bet_number': i + 1,
+                        'total_bets': len(bet_slips),
+                        'successful_so_far': successful
+                    }
+                )
+                
                 # Save progress before stopping
                 with open(progress_file, 'w') as f:
                     json.dump({
@@ -3314,6 +4049,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         'timestamp': datetime.now().isoformat(),
                         'matches_data': matches
                     }, f)
+                
+                error_tracker.display_summary()
+                error_tracker.save_to_file()
+                
                 break
             
             try:
@@ -3329,6 +4068,23 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     # Network failure - mark bet as failed
                     print(f"\n[CRITICAL ERROR] Network failure after retries: {e}")
                     print("[ERROR] Marking bet as failed (no browser restart)")
+                    
+                    # Determine error type
+                    error_str = str(e).lower()
+                    if 'timeout' in error_str:
+                        error_type = 'TIMEOUT'
+                    else:
+                        error_type = 'NETWORK_FAILURE'
+                    
+                    error_tracker.add_error(
+                        error_type=error_type,
+                        error_message=f'Network/timeout failure during bet {bet_slip["slip_number"]} placement: {str(e)[:150]}',
+                        context={
+                            'bet_number': bet_slip['slip_number'],
+                            'exception_type': type(e).__name__
+                        },
+                        exception=e
+                    )
                     success = False
                 
                 if success == True:
@@ -3420,6 +4176,16 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     # Click failed but may succeed on retry - don't count as failed yet
                     print(f"\n⚠️ [RETRY NEEDED] Bet slip {bet_slip['slip_number']} click failed - will retry...")
                     
+                    # Track the retry attempt
+                    error_tracker.add_error(
+                        error_type='RETRY_FAILED',
+                        error_message=f'Bet slip {bet_slip["slip_number"]} required retry - click failed on first attempt',
+                        context={
+                            'bet_number': bet_slip['slip_number'],
+                            'action': 'retry_in_progress'
+                        }
+                    )
+                    
                     # Wait a bit before retrying
                     print("  Waiting 10 seconds before retry...")
                     await page.wait_for_timeout(10000)
@@ -3453,6 +4219,18 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         failed_bets.append(bet_slip)
                         print(f"\n❌ [FAILED] Retry bet slip {bet_slip['slip_number']} also failed!")
                         
+                        # Track the retry failure
+                        error_tracker.add_error(
+                            error_type='RETRY_FAILED',
+                            error_message=f'Bet slip {bet_slip["slip_number"]} failed on retry attempt - terminating',
+                            context={
+                                'bet_number': bet_slip['slip_number'],
+                                'successful_so_far': successful,
+                                'failed_so_far': failed,
+                                'action': 'terminating'
+                            }
+                        )
+                        
                         # Save progress at failed bet (so resume will retry THIS bet)
                         with open(progress_file, 'w') as f:
                             json.dump({
@@ -3472,6 +4250,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
                         print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
                         print(f"{'='*60}\n")
+                        
+                        # Display error summary before exiting
+                        error_tracker.display_summary()
+                        error_tracker.save_to_file()
                         
                         try:
                             await page.close()
@@ -3594,6 +4376,17 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         failed_bets.append(bet_slip)
                         print(f"\n❌ [FATAL] Re-login failed! Cannot continue betting.")
                         
+                        # Track the re-login failure
+                        error_tracker.add_error(
+                            error_type='RELOGIN_FAILED',
+                            error_message=f'Re-login failed during bet {bet_slip["slip_number"]} - cannot continue',
+                            context={
+                                'bet_number': bet_slip['slip_number'],
+                                'successful_so_far': successful,
+                                'failed_so_far': failed
+                            }
+                        )
+                        
                         # Save progress and terminate
                         with open(progress_file, 'w') as f:
                             json.dump({
@@ -3613,6 +4406,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
                         print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
                         print(f"{'='*60}\n")
+                        
+                        # Display error summary before exiting
+                        error_tracker.display_summary()
+                        error_tracker.save_to_file()
                         
                         try:
                             await page.close()
@@ -3640,6 +4437,18 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                             'matches_data': matches  # Save match data for resume
                         }, f)
                     
+                    # Track the bet failure
+                    error_tracker.add_error(
+                        error_type="BET_FAILED",
+                        error_message=f"Bet slip {bet_slip['slip_number']} failed during placement",
+                        context={
+                            'bet_number': bet_slip['slip_number'],
+                            'total_bets': len(bet_slips),
+                            'successful_so_far': successful,
+                            'failed_so_far': failed
+                        }
+                    )
+                    
                     # CRITICAL: Terminate ALL bets if any bet fails
                     print(f"\n{'='*60}")
                     print(f"⛔ TERMINATING ALL BETS - BET FAILED")
@@ -3648,6 +4457,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
                     print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
                     print(f"{'='*60}\n")
+                    
+                    # Display error summary before exiting
+                    error_tracker.display_summary()
+                    error_tracker.save_to_file()
                     
                     # Close browser and exit application completely
                     try:
@@ -3676,6 +4489,16 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     print(f"{'='*60}")
                     print(f"Error: {error_str[:150]}...")
                     print(f"\n🔄 Attempting recovery with fresh browser...")
+                    
+                    # Track the memory error
+                    error_tracker.add_error(
+                        error_type='MEMORY_ERROR',
+                        error_message=f'Playwright memory corruption detected: {error_str[:150]}',
+                        context={
+                            'bet_number': bet_slip['slip_number'],
+                            'action': 'attempting_recovery'
+                        }
+                    )
                     
                     # Force garbage collection
                     gc.collect()
@@ -3753,6 +4576,18 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                             'matches_data': matches
                         }, f)
                     
+                    # Track the unrecoverable memory error
+                    error_tracker.add_error(
+                        error_type='MEMORY_ERROR',
+                        error_message='Playwright memory corruption - recovery failed, restart required',
+                        context={
+                            'bet_number': bet_slip['slip_number'],
+                            'successful_so_far': successful,
+                            'failed_so_far': failed,
+                            'action': 'terminating_for_restart'
+                        }
+                    )
+                    
                     print(f"\n{'='*60}")
                     print(f"⚠️ PLAYWRIGHT MEMORY ERROR - RESTART REQUIRED")
                     print(f"{'='*60}")
@@ -3760,6 +4595,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
                     print(f"📋 Progress saved - auto-restart will resume")
                     print(f"{'='*60}\n")
+                    
+                    # Display error summary before exiting
+                    error_tracker.display_summary()
+                    error_tracker.save_to_file()
                     
                     try:
                         await page.close()
@@ -3774,6 +4613,19 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                 failed += 1
                 failed_bets.append(bet_slip)  # Store failed bet for retry
                 print(f"\n[ERROR] Exception on slip {bet_slip['slip_number']}: {e}")
+                
+                # Track the exception
+                error_tracker.add_error(
+                    error_type="EXCEPTION",
+                    error_message=f"Exception during bet {bet_slip['slip_number']} placement",
+                    context={
+                        'bet_number': bet_slip['slip_number'],
+                        'total_bets': len(bet_slips),
+                        'successful_so_far': successful,
+                        'failed_so_far': failed
+                    },
+                    exception=e
+                )
                 
                 # Save progress at failed bet (so resume will retry THIS bet)
                 with open(progress_file, 'w') as f:
@@ -3796,6 +4648,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                 print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
                 print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
                 print(f"{'='*60}\n")
+                
+                # Display error summary before exiting
+                error_tracker.display_summary()
+                error_tracker.save_to_file()
                 
                 # Close browser and exit application completely
                 try:
@@ -3844,6 +4700,13 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         print(f"FINAL RESULTS: {successful}/{len(bet_slips)} successful, {failed} failed")
         print(f"Total amount wagered: R{successful * amount_per_slip:.2f}")
         print("="*60)
+        
+        # Display error summary (will show even if no errors - provides confirmation)
+        error_tracker.display_summary()
+        
+        # Save error log if there were any errors
+        if error_tracker.get_error_count() > 0:
+            error_tracker.save_to_file()
         
         # Clean up progress file ONLY if ALL bets successful
         if os.path.exists(progress_file):
@@ -3944,6 +4807,8 @@ def main_with_auto_retry():
     - Unexpected exceptions (any non-zero exit code)
     - Process timeouts (hangs)
     - Signal terminations
+    
+    All crashes are logged to error_tracker and displayed at the end.
     """
     import sys
     import subprocess
@@ -3953,6 +4818,9 @@ def main_with_auto_retry():
     MAX_RETRIES = 5  # Maximum number of automatic restarts
     RETRY_DELAY = 15  # Seconds to wait before restarting
     SUBPROCESS_TIMEOUT = 3600  # 1 hour timeout per subprocess (prevents hangs)
+    
+    # Create a wrapper-level error tracker to track subprocess crashes
+    wrapper_crashes = []  # List of crash details for summary
     
     # Get the original arguments
     args = sys.argv[1:]  # Everything after script name
@@ -3972,6 +4840,7 @@ def main_with_auto_retry():
     print(f"   Retry delay: {RETRY_DELAY}s")
     print(f"   Subprocess timeout: {SUBPROCESS_TIMEOUT}s ({SUBPROCESS_TIMEOUT//60} min)")
     print(f"   Progress file: bet_progress.json")
+    print(f"   All crashes will be logged and displayed at end")
     print(f"{'='*60}\n")
     
     while retry_count <= MAX_RETRIES:
@@ -4015,18 +4884,55 @@ def main_with_auto_retry():
             error_reason = f"TIMEOUT (hung for >{SUBPROCESS_TIMEOUT}s)"
             print(f"\n⚠️ SUBPROCESS TIMEOUT - Process hung for over {SUBPROCESS_TIMEOUT} seconds")
             
+            # Track this crash
+            wrapper_crashes.append({
+                'attempt': retry_count + 1,
+                'error_type': 'TIMEOUT',
+                'error_message': f'Subprocess hung for over {SUBPROCESS_TIMEOUT} seconds',
+                'timestamp': datetime.now().isoformat(),
+                'exit_code': exit_code
+            })
+            
         except KeyboardInterrupt:
             elapsed_total = time_module.time() - total_start_time
             elapsed_mins = int(elapsed_total // 60)
             print(f"\n\n⛔ Interrupted by user (Ctrl+C)")
             print(f"   Total time: {elapsed_mins} minutes")
             print(f"   Progress saved. Run again to resume.")
+            
+            # Track the interruption
+            wrapper_crashes.append({
+                'attempt': retry_count + 1,
+                'error_type': 'CANCELLED',
+                'error_message': 'Script interrupted by user (Ctrl+C)',
+                'timestamp': datetime.now().isoformat(),
+                'exit_code': -3
+            })
+            
+            # Display wrapper crash summary if any crashes occurred
+            if wrapper_crashes:
+                print(f"\n{'='*60}")
+                print(f"📊 AUTO-RETRY WRAPPER CRASH SUMMARY")
+                print(f"{'='*60}")
+                for crash in wrapper_crashes:
+                    print(f"  Attempt {crash['attempt']}: {crash['error_type']} - {crash['error_message'][:50]}")
+                print(f"{'='*60}\n")
+            
             return  # Exit completely
             
         except Exception as e:
             exit_code = -2
             error_reason = f"SUBPROCESS ERROR: {str(e)[:100]}"
             print(f"\n❌ Subprocess error: {e}")
+            
+            # Track this crash
+            wrapper_crashes.append({
+                'attempt': retry_count + 1,
+                'error_type': 'EXCEPTION',
+                'error_message': str(e)[:150],
+                'timestamp': datetime.now().isoformat(),
+                'exit_code': exit_code
+            })
         
         # Check result
         if exit_code == 0:
@@ -4045,6 +4951,18 @@ def main_with_auto_retry():
         retry_count += 1
         attempt_elapsed = time_module.time() - attempt_start_time
         
+        # Track this crash in wrapper_crashes list
+        if not error_reason:  # Only add if not already added above
+            crash_error_type = 'EXCEPTION' if exit_code != 0 else 'UNKNOWN'
+            wrapper_crashes.append({
+                'attempt': retry_count,
+                'error_type': crash_error_type,
+                'error_message': f'Subprocess exited with code {exit_code}',
+                'timestamp': datetime.now().isoformat(),
+                'exit_code': exit_code,
+                'attempt_duration': int(attempt_elapsed)
+            })
+        
         if retry_count <= MAX_RETRIES:
             print(f"\n{'='*60}")
             if error_reason:
@@ -4053,6 +4971,7 @@ def main_with_auto_retry():
                 print(f"⚠️ SCRIPT CRASHED (exit code: {exit_code})")
             print(f"   Attempt ran for: {int(attempt_elapsed)}s")
             print(f"   Progress is saved to bet_progress.json")
+            print(f"   Total crashes so far: {len(wrapper_crashes)}")
             print(f"\n🔄 AUTO-RESTART in {RETRY_DELAY} seconds...")
             print(f"   Restart attempt: {retry_count}/{MAX_RETRIES}")
             print(f"{'='*60}\n")
@@ -4069,19 +4988,155 @@ def main_with_auto_retry():
             print(f"   Total time spent: {elapsed_mins} minutes")
             print(f"\n💡 Progress is saved. Restart manually with:")
             print(f"   python main.py {' '.join(args)}")
-            print(f"{'='*60}\n")
+            print(f"{'='*60}")
+            
+            # Display comprehensive crash summary
+            if wrapper_crashes:
+                print(f"\n{'='*60}")
+                print(f"📊 ALL CRASHES DURING AUTO-RETRY SESSION")
+                print(f"{'='*60}")
+                print(f"Total crashes: {len(wrapper_crashes)}")
+                print(f"")
+                for i, crash in enumerate(wrapper_crashes, 1):
+                    print(f"Crash #{i}:")
+                    print(f"  Attempt: {crash['attempt']}")
+                    print(f"  Type: {crash['error_type']}")
+                    print(f"  Message: {crash['error_message']}")
+                    print(f"  Exit Code: {crash['exit_code']}")
+                    print(f"  Duration: {crash.get('attempt_duration', 'N/A')}s")
+                    print(f"  Timestamp: {crash['timestamp']}")
+                    print(f"")
+                print(f"{'='*60}\n")
+            
             return  # Exit after max retries
 
 
 if __name__ == "__main__":
     import sys
     
+    # ============================================================================
+    # GLOBAL EXCEPTION HANDLER (Enhanced)
+    # ============================================================================
+    def global_exception_handler(exc_type, exc_value, exc_traceback):
+        """
+        Global exception handler to catch any unhandled exceptions.
+        Ensures all crashes are logged to the error tracker before exit.
+        This captures:
+        - Timeouts that cause application to crash
+        - Network failures
+        - Playwright memory corruption errors
+        - Any other unexpected exceptions
+        """
+        # Don't handle keyboard interrupts
+        if issubclass(exc_type, KeyboardInterrupt):
+            # Still log it as a user-initiated cancellation
+            try:
+                error_tracker.add_error(
+                    error_type="CANCELLED",
+                    error_message="Script interrupted by user (Ctrl+C)",
+                    context={'exception_type': 'KeyboardInterrupt'}
+                )
+                error_tracker.display_summary()
+                error_tracker.save_to_file()
+            except:
+                pass
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        
+        # Format the traceback
+        import traceback as tb_module
+        tb_str = ''.join(tb_module.format_exception(exc_type, exc_value, exc_traceback))
+        
+        # Determine specific error type based on exception details
+        error_str = str(exc_value).lower()
+        
+        # Classify the error type for better Problem Details
+        if 'timeout' in error_str:
+            error_type = 'TIMEOUT'
+            error_title = 'Timeout Error Caused Crash'
+        elif any(kw in error_str for kw in ['err_name_not_resolved', 'err_connection', 'err_internet_disconnected', 'net::']):
+            error_type = 'NETWORK_FAILURE'
+            error_title = 'Network Failure Caused Crash'
+        elif "'dict' object has no attribute '_object'" in error_str or 'object has been collected' in error_str:
+            error_type = 'MEMORY_ERROR'
+            error_title = 'Playwright Memory Corruption Caused Crash'
+        elif 'target page, context or browser has been closed' in error_str:
+            error_type = 'BROWSER_RESTART'
+            error_title = 'Browser/Page Closed Unexpectedly'
+        elif issubclass(exc_type, asyncio.CancelledError):
+            error_type = 'CANCELLED'
+            error_title = 'Async Operation Cancelled'
+        else:
+            error_type = 'UNHANDLED_EXCEPTION'
+            error_title = 'Unhandled Exception Caused Crash'
+        
+        print(f"\n{'='*70}")
+        print(f"💥 {error_title.upper()} - GLOBAL HANDLER CAUGHT")
+        print(f"{'='*70}")
+        print(f"Exception Type: {exc_type.__name__}")
+        print(f"Exception Message: {exc_value}")
+        print(f"Error Category: {error_type}")
+        print(f"{'='*70}\n")
+        
+        # Log to error tracker with detailed context
+        try:
+            error_tracker.add_error(
+                error_type=error_type,
+                error_message=f"{error_title}: {exc_type.__name__}: {str(exc_value)[:200]}",
+                context={
+                    'exception_type': exc_type.__name__,
+                    'exception_message': str(exc_value),
+                    'traceback': tb_str,
+                    'crash_type': 'application_crash',
+                    'recovery_possible': PROBLEM_TYPES.get(error_type, {}).get('recoverable', True)
+                }
+            )
+            
+            # Always display and save error summary on crash
+            print(f"\n📊 Displaying all errors that occurred during this session...\n")
+            error_tracker.display_summary()
+            error_tracker.save_to_file()
+        except Exception as e:
+            print(f"⚠️ Could not log to error tracker: {e}")
+            print(f"\nFull traceback:")
+            print(tb_str)
+        
+        # Call the default exception hook
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+    
+    # Install global exception handler
+    sys.excepthook = global_exception_handler
+    
     # Check if we're being called directly (by subprocess) or as the main entry point
     if len(sys.argv) >= 2 and sys.argv[1] == '--direct':
         # Called by subprocess - run main() directly
         # Remove the --direct flag and pass remaining args
         sys.argv = [sys.argv[0]] + sys.argv[2:]
-        main()
+        try:
+            main()
+        except Exception as e:
+            # Catch any exception that might slip through
+            error_tracker.add_error(
+                error_type="EXCEPTION",
+                error_message=f"Main function crashed with: {str(e)[:200]}",
+                context={'mode': 'direct'},
+                exception=e
+            )
+            error_tracker.display_summary()
+            error_tracker.save_to_file()
+            raise
     else:
         # Called normally - use the auto-retry wrapper
-        main_with_auto_retry()
+        try:
+            main_with_auto_retry()
+        except Exception as e:
+            # Catch any exception from the wrapper
+            error_tracker.add_error(
+                error_type="EXCEPTION",
+                error_message=f"Auto-retry wrapper crashed with: {str(e)[:200]}",
+                context={'mode': 'auto-retry'},
+                exception=e
+            )
+            error_tracker.display_summary()
+            error_tracker.save_to_file()
+            raise
