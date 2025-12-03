@@ -701,7 +701,7 @@ async def login_to_betway(playwright):
     browser = await playwright.chromium.launch(
         headless=False,
         args=[
-            '--disable-dev-shm-usage',  # Use /tmp instead of /dev/shm (prevents memory issues)
+            '--disable-dev-shm-usage',  # Prevents shared memory issues in containerized/memory-constrained environments
             '--no-sandbox',
             '--disable-gpu',
             '--disable-software-rasterizer',
@@ -3250,7 +3250,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     print("Invalid input. Please enter a number.")
         
         # Calculate dynamic min_time_before_match based on estimated runtime
-        # Formula: (3^num_matches) * (7/3) minutes = estimated runtime
+        # Each bet takes approximately 7/3 (~2.33) minutes to place
+        # Total estimated runtime = total_combinations * time_per_bet
         # Add 30 minutes buffer for safety
         total_combinations = 3 ** num_matches
         estimated_runtime_minutes = total_combinations * (7 / 3)  # ~2.33 min per bet
@@ -4074,7 +4075,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         print(f"{'='*60}")
         
         total_bets = 3 ** num_matches  # 3 outcomes (1, X, 2) per match
-        avg_time_per_bet = 7 / 3  # Based on: 3 combinations takes ~7 minutes
+        avg_time_per_bet = 7 / 3  # ~2.33 minutes per bet (based on empirical observation)
         total_time_needed = total_bets * avg_time_per_bet
         estimated_hours = math.ceil(total_time_needed / 60)
         

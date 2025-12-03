@@ -11,6 +11,7 @@ Automated betting system for Betway that creates all possible outcome combinatio
 - Verifies successful login by checking balance
 - Includes network retry mechanism with exponential backoff (3 retries: 5s → 10s → 20s)
 - Multiple login button selectors for reliability
+- Session monitoring with automatic re-login if session expires during betting
 
 ### 2. User Input
 
@@ -30,20 +31,22 @@ python main.py <num_matches> <amount_per_slip>
 
 - Skips interactive prompts
 - Useful for automated testing or scheduling
+- Includes **auto-retry wrapper** that restarts the script on crashes (up to 5 retries)
 
 ### 3. Automatic Match Selection
 
 The system automatically:
 
-- Navigates to upcoming soccer matches (Premier League - Full-Time Result market)
-- **Single Scraping Pass**: Scrapes up to 20 pages ONCE at the beginning
+- **Smart Scraping**: Scrapes from **Highlights page first** (featured matches), then **Upcoming page** as fallback
+- **Single Scraping Pass**: Scrapes up to 20 pages per source ONCE at the beginning
+- **Time-Based Sorting**: Highlights matches are sorted by start time, then by highest odds for same time slots
 - **URL Caching**: Captures and stores match URLs for every match during the single scraping pass
 - **Offline Filtering**: Filters scraped matches to find those meeting requirements (no additional scraping)
 - **URL Validation**: Verifies all selected matches have cached URLs before allowing any bets
-- Filters matches that start 3.5+ hours from now
-- Ensures minimum 2.5-hour gaps between matches
+- **Dynamic Timing**: Calculates minimum time before first match based on estimated script runtime + 30min buffer
+- Ensures minimum **2-hour gaps** between matches
 - Validates time requirements before proceeding
-- User selects the desired number of matches (Interactive Mode only)
+- **Balance Validation**: Checks if account balance is sufficient for all bets before starting
 
 ### 4. Combination Generation
 
@@ -58,7 +61,7 @@ The system automatically:
 
 **Bet Slip Examples:**
 
-```
+```text
 Slip 1:  Match1=1, Match2=1, Match3=1
 Slip 2:  Match1=1, Match2=1, Match3=X
 Slip 3:  Match1=1, Match2=1, Match3=2
@@ -134,11 +137,12 @@ The system workflow:
 
 7. **Network Retry**: Automatic retry on connection errors (exponential backoff: 5s → 10s → 20s)
 
-8. **Anti-Detection Features** (preserved from original):
+8. **Anti-Detection Features**:
 
    - Random delays between bets (5s base + 10-60s random)
-   - Browser restart every 5 bets
-   - Varying wait times
+   - **Browser restart every 10 bets** (creates fresh browser instance)
+   - **Page refresh every 5 bets** (clears DOM state)
+   - Garbage collection after each bet
    - Human-like behavior patterns
 
 9. **Termination on Failure**: If any bet fails, the entire application stops immediately
@@ -159,7 +163,7 @@ playwright install chromium
 
 3. Create a `.env` file with your credentials:
 
-```
+```ini
 BETWAY_USERNAME=your_username
 BETWAY_PASSWORD=your_password
 ```
@@ -170,7 +174,7 @@ BETWAY_PASSWORD=your_password
 - `.env` - Credentials (username and password)
 - `requirements.txt` - Python dependencies
 - `bet_progress.json` - Auto-generated progress tracking (allows resume on failure)
-- `RETRY_MECHANISM.md` - Documentation for network retry features
+- `error_log.json` - Auto-generated error log using RFC 7807 Problem Details format
 
 ## Usage
 
@@ -188,10 +192,11 @@ This will:
 4. Prompt you for amount per slip
 5. Show total cost
 6. Ask for confirmation at each step
-7. Automatically find suitable matches (3.5+ hours away, 2.5+ hour gaps)
-8. Place all bet combinations
-9. Track progress in `bet_progress.json`
-10. Auto-resume if interrupted
+7. **Validate account balance** is sufficient for all bets
+8. Automatically find suitable matches (dynamic timing based on estimated runtime, 2-hour gaps)
+9. Place all bet combinations
+10. Track progress in `bet_progress.json`
+11. Auto-resume if interrupted
 
 ### CLI Mode (Automated)
 
@@ -209,10 +214,12 @@ This will:
 
 1. Login automatically using `.env` credentials
 2. Skip interactive prompts (uses provided arguments)
-3. Automatically find suitable matches
-4. Place all bet combinations (3^2 = 9 slips at R1.0 each)
-5. Track progress in `bet_progress.json`
-6. Auto-resume if interrupted
+3. **Validate account balance** is sufficient for all bets
+4. Automatically find suitable matches
+5. Place all bet combinations (3^2 = 9 slips at R1.0 each)
+6. Track progress in `bet_progress.json`
+7. **Auto-retry wrapper** restarts on crashes (up to 5 retries)
+8. Auto-resume if interrupted
 
 ## Key Features
 
@@ -222,20 +229,26 @@ This will:
 - **Progress tracking** - Saves progress after each bet in `bet_progress.json`
 - **Auto-resume** - Continues from last successful bet if script restarts
 - **Browser recovery** - Restarts browser and reconnects on failures
+- **Auto-retry wrapper** - CLI mode spawns fresh process on crashes (up to 5 retries)
+- **Session monitoring** - Detects session expiry and re-authenticates automatically
 
 ### Anti-Detection
 
 - **Random delays** - Adds 10-60 second random waits between bets
-- **Browser restarts** - Clears tracking data every 5 bets
+- **Browser restarts** - Creates fresh browser instance every 10 bets
+- **Page refreshes** - Clears DOM state every 5 bets
+- **Garbage collection** - Memory cleanup after each bet
 - **Variable timing** - Mimics human-like behavior
 
 ### Smart Match Selection
 
-- **Time-based filtering** - Only matches starting 3.5+ hours from now
-- **Gap validation** - Ensures 2.5+ hour gaps between matches
-- **Pagination support** - Automatically searches up to 20 pages
+- **Smart scraping** - Highlights page first (sorted by time/odds), then Upcoming as fallback
+- **Dynamic timing** - First match timing calculated based on estimated script runtime + 30min buffer
+- **Gap validation** - Ensures 2-hour gaps between matches
+- **Pagination support** - Automatically searches up to 20 pages per source
 - **URL caching** - Captures match URLs during scraping for direct navigation
 - **Runtime validation** - Double-checks time requirements before betting
+- **Balance validation** - Verifies sufficient funds before placing any bets
 
 ### Performance Optimizations
 
@@ -264,9 +277,10 @@ This will:
 4. **Watch the first few bets** - Verify they're placing correctly
 5. **Don't close the browser** - The automation controls the browser window
 6. **Resume capability** - If interrupted, run again to continue from last successful bet
-7. **Match timing** - Only selects matches starting 3.5+ hours away with 2.5+ hour gaps
+7. **Dynamic match timing** - First match timing calculated based on script runtime + 30min buffer, with 2-hour gaps between matches
 8. **Pagination** - Automatically clicks "Next" button to load more matches as needed
 9. **Termination on failure** - Application stops completely if any bet fails (check logs for details)
+10. **Error logging** - All errors saved to `error_log.json` using RFC 7807 Problem Details format
 
 ## Calculation Table
 
@@ -305,10 +319,11 @@ This will:
 
 ### Not enough matches found
 
-- System searches up to 20 pages using pagination
-- Automatically clicks "Next" button to load more matches
+- System searches Highlights page first, then Upcoming page as fallback
+- Automatically clicks "Next" button to load more matches (up to 20 pages per source)
 - Captures and caches match URLs during scraping
-- Looks for matches starting 3.5+ hours away with 2.5+ hour gaps
+- Uses dynamic timing based on estimated script runtime + 30min buffer
+- Ensures 2-hour gaps between selected matches
 - Try during peak hours (more upcoming matches available)
 - Try with fewer matches (2 instead of 3)
 - Check that upcoming soccer matches exist on Betway
@@ -320,3 +335,40 @@ This will:
 - If a match URL was not captured during scraping, the system stops before placing ANY bets
 - This prevents partial bet placement and ensures all-or-nothing approach
 - System will log detailed error showing which matches are missing URLs
+
+## Error Tracking (RFC 7807)
+
+The system uses RFC 7807 Problem Details format for comprehensive error tracking:
+
+- **Categorized errors** - Errors grouped by type (network, authentication, business logic, etc.)
+- **Detailed context** - Each error includes timestamp, session ID, and relevant context
+- **Recoverable vs fatal** - Errors marked as recoverable or fatal for appropriate handling
+- **Suggested actions** - Each error type includes suggested recovery actions
+- **JSON export** - All errors saved to `error_log.json` for post-mortem analysis
+
+Error categories tracked:
+
+- `TIMEOUT` - Operation timeouts
+- `NETWORK_FAILURE` - Connection issues
+- `SESSION_EXPIRED` - Login session lost
+- `BET_FAILED` - Bet placement failures
+- `MEMORY_ERROR` - Playwright memory corruption
+- `BROWSER_RESTART` - Browser restart events
+
+## Auto-Retry Wrapper (CLI Mode)
+
+When running in CLI mode, the script includes an auto-retry wrapper:
+
+- **Process isolation** - Each retry spawns a completely new Python process
+- **Memory cleanup** - Fresh memory state prevents Playwright corruption
+- **Progress preservation** - Resumes from last saved bet on restart
+- **Configurable retries** - Up to 5 automatic restarts (configurable)
+- **Timeout protection** - 1-hour timeout per subprocess prevents hangs
+- **Crash logging** - All crashes tracked and summarized at end
+
+Example:
+
+```bash
+# Auto-retry wrapper is active automatically in CLI mode
+python main.py 2 1.0
+```
