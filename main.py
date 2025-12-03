@@ -1678,6 +1678,7 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     
                     # If cache miss or cached selector failed, try all selectors
                     if len(outcome_buttons) < 3:
+                        # Extended list of selectors to handle different league page structures
                         button_selectors = [
                             'div.grid.p-1 > div.flex.items-center.justify-between.h-12',
                             'div[class*="grid"] > div[class*="flex items-center justify-between h-12"]',
@@ -1685,6 +1686,17 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             'div[price]',
                             'button[data-translate-market-name="Full Time Result"] div[price]',
                             'div[data-translate-market-name="Full Time Result"] div[price]',
+                            # Additional fallback selectors for different league structures
+                            'div[class*="market"] div[price]',
+                            'div[class*="outcome"] div[price]',
+                            'div.flex.items-center.justify-between[price]',
+                            'button[price]',
+                            'div[data-price]',
+                            'span[price]',
+                            # More generic selectors as last resort
+                            'div[class*="selection"]',
+                            'div[class*="bet-button"]',
+                            'div[class*="odds"]',
                         ]
                         
                         for selector in button_selectors:
@@ -3209,6 +3221,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
     # Start timer
     import time
     script_start_time = time.time()
+    cumulative_runtime_seconds = 0.0  # Track total runtime across crashes/restarts
     
     async with async_playwright() as p:
         print("Starting Betway Automation...")
@@ -3338,6 +3351,13 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     print(f"{'='*60}")
                     print(f"Last completed bet: {resume_data.get('last_completed_bet', 0)}")
                     print(f"Successful: {resume_data.get('successful', 0)} | Failed: {resume_data.get('failed', 0)}")
+                    
+                    # Load cumulative runtime from previous sessions
+                    cumulative_runtime_seconds = resume_data.get('cumulative_runtime_seconds', 0.0)
+                    if cumulative_runtime_seconds > 0:
+                        prev_mins = int(cumulative_runtime_seconds // 60)
+                        prev_secs = int(cumulative_runtime_seconds % 60)
+                        print(f"Previous runtime: {prev_mins}m {prev_secs}s")
                     
                     # Check if we have saved match data
                     if 'matches_data' in resume_data:
@@ -4189,6 +4209,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     await page.wait_for_timeout(500)
                     
                     # Find working selector for outcome buttons
+                    # Extended list of selectors to handle different league page structures
                     button_selectors = [
                         'div.grid.p-1 > div.flex.items-center.justify-between.h-12',
                         'div[class*="grid"] > div[class*="flex items-center justify-between h-12"]',
@@ -4196,6 +4217,17 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         'div[price]',
                         'button[data-translate-market-name="Full Time Result"] div[price]',
                         'div[data-translate-market-name="Full Time Result"] div[price]',
+                        # Additional fallback selectors for different league structures
+                        'div[class*="market"] div[price]',
+                        'div[class*="outcome"] div[price]',
+                        'div.flex.items-center.justify-between[price]',
+                        'button[price]',
+                        'div[data-price]',
+                        'span[price]',
+                        # More generic selectors as last resort
+                        'div[class*="selection"]',
+                        'div[class*="bet-button"]',
+                        'div[class*="odds"]',
                     ]
                     
                     working_selector = None
@@ -4343,7 +4375,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         'failed': failed,
                         'match_fingerprint': current_match_fingerprint,
                         'timestamp': datetime.now().isoformat(),
-                        'matches_data': matches
+                        'matches_data': matches,
+                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
                     }, f)
                 
                 error_tracker.display_summary()
@@ -4353,13 +4386,36 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             
             try:
                 # Try to place bet with retry on network errors
+                # Per-bet timeout: 5 minutes (300 seconds) to prevent hangs
+                PER_BET_TIMEOUT = 300  # 5 minutes
+                
                 try:
-                    success = await retry_with_backoff(
-                        place_bet_slip,
-                        max_retries=3,
-                        initial_delay=5,
-                        page=page, bet_slip=bet_slip, amount=amount_per_slip, match_cache=match_cache, outcome_button_cache=outcome_button_cache
+                    # Wrap the bet placement in asyncio.wait_for with timeout
+                    success = await asyncio.wait_for(
+                        retry_with_backoff(
+                            place_bet_slip,
+                            max_retries=3,
+                            initial_delay=5,
+                            page=page, bet_slip=bet_slip, amount=amount_per_slip, match_cache=match_cache, outcome_button_cache=outcome_button_cache
+                        ),
+                        timeout=PER_BET_TIMEOUT
                     )
+                except asyncio.TimeoutError:
+                    # Per-bet timeout exceeded - bet took longer than 5 minutes
+                    print(f"\n⏱️ [PER-BET TIMEOUT] Bet {bet_slip['slip_number']} exceeded {PER_BET_TIMEOUT}s ({PER_BET_TIMEOUT//60} min) timeout!")
+                    print(f"[ERROR] Marking bet as failed and triggering retry...")
+                    
+                    error_tracker.add_error(
+                        error_type='TIMEOUT',
+                        error_message=f'Per-bet timeout ({PER_BET_TIMEOUT}s) exceeded for bet {bet_slip["slip_number"]} - operation hung',
+                        context={
+                            'bet_number': bet_slip['slip_number'],
+                            'timeout_seconds': PER_BET_TIMEOUT,
+                            'action': 'will_retry_or_terminate'
+                        }
+                    )
+                    success = "RETRY"  # Trigger retry logic instead of hard failure
+                    
                 except (PlaywrightError, PlaywrightTimeoutError) as e:
                     # Network failure - mark bet as failed
                     print(f"\n[CRITICAL ERROR] Network failure after retries: {e}")
@@ -4388,6 +4444,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     print(f"\n[SUCCESS] Bet slip {bet_slip['slip_number']} placed!")
                     
                     # Save progress - track last SUCCESSFUL bet index
+                    # Calculate current session runtime to add to cumulative
+                    current_session_runtime = time.time() - script_start_time
                     with open(progress_file, 'w') as f:
                         json.dump({
                             'last_completed_bet': i + 1,  # Next bet to attempt
@@ -4396,7 +4454,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                             'failed': failed,
                             'match_fingerprint': current_match_fingerprint,
                             'timestamp': datetime.now().isoformat(),
-                            'matches_data': matches  # Save match data for resume
+                            'matches_data': matches,  # Save match data for resume
+                            'cumulative_runtime_seconds': cumulative_runtime_seconds + current_session_runtime  # Track total runtime
                         }, f)
                     
                     # AGGRESSIVE memory management to prevent Playwright corruption
@@ -4503,7 +4562,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                 'failed': failed,
                                 'match_fingerprint': current_match_fingerprint,
                                 'timestamp': datetime.now().isoformat(),
-                                'matches_data': matches  # Save match data for resume
+                                'matches_data': matches,
+                                'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
                             }, f)
                         
                         # Wait between bets
@@ -4536,7 +4596,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                 'failed': failed,
                                 'match_fingerprint': current_match_fingerprint,
                                 'timestamp': datetime.now().isoformat(),
-                                'matches_data': matches  # Save match data for resume
+                                'matches_data': matches,
+                                'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
                             }, f)
                         
                         print(f"\n{'='*60}")
@@ -4626,7 +4687,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                     'failed': failed,
                                     'match_fingerprint': current_match_fingerprint,
                                     'timestamp': datetime.now().isoformat(),
-                                    'matches_data': matches
+                                    'matches_data': matches,
+                                    'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
                                 }, f)
                             
                             # Wait between bets
@@ -4647,7 +4709,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                     'failed': failed,
                                     'match_fingerprint': current_match_fingerprint,
                                     'timestamp': datetime.now().isoformat(),
-                                    'matches_data': matches
+                                    'matches_data': matches,
+                                    'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
                                 }, f)
                             
                             print(f"\n{'='*60}")
@@ -4692,7 +4755,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                 'failed': failed,
                                 'match_fingerprint': current_match_fingerprint,
                                 'timestamp': datetime.now().isoformat(),
-                                'matches_data': matches
+                                'matches_data': matches,
+                                'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
                             }, f)
                         
                         print(f"\n{'='*60}")
@@ -4730,7 +4794,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                             'failed': failed,
                             'match_fingerprint': current_match_fingerprint,
                             'timestamp': datetime.now().isoformat(),
-                            'matches_data': matches  # Save match data for resume
+                            'matches_data': matches,
+                            'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
                         }, f)
                     
                     # Track the bet failure
@@ -4845,7 +4910,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                         'failed': failed,
                                         'match_fingerprint': current_match_fingerprint,
                                         'timestamp': datetime.now().isoformat(),
-                                        'matches_data': matches
+                                        'matches_data': matches,
+                                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
                                     }, f)
                                 
                                 # Continue to next bet
@@ -4869,7 +4935,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                             'failed': failed,
                             'match_fingerprint': current_match_fingerprint,
                             'timestamp': datetime.now().isoformat(),
-                            'matches_data': matches
+                            'matches_data': matches,
+                            'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
                         }, f)
                     
                     # Track the unrecoverable memory error
@@ -4932,7 +4999,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         'failed': failed,
                         'match_fingerprint': current_match_fingerprint,
                         'timestamp': datetime.now().isoformat(),
-                        'matches_data': matches  # Save match data for resume
+                        'matches_data': matches,
+                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
                     }, f)
                 
                 # CRITICAL: Terminate ALL bets after exception
@@ -5023,20 +5091,40 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         
         # End timer and display results
         script_end_time = time.time()
-        total_duration = script_end_time - script_start_time
-        hours = int(total_duration // 3600)
-        minutes = int((total_duration % 3600) // 60)
-        seconds = int(total_duration % 60)
+        session_duration = script_end_time - script_start_time
+        total_duration = cumulative_runtime_seconds + session_duration  # Include previous sessions
+        
+        # Format session time
+        sess_hours = int(session_duration // 3600)
+        sess_minutes = int((session_duration % 3600) // 60)
+        sess_seconds = int(session_duration % 60)
+        
+        # Format total time (cumulative)
+        total_hours = int(total_duration // 3600)
+        total_minutes = int((total_duration % 3600) // 60)
+        total_seconds = int(total_duration % 60)
         
         print("\n" + "="*60)
         print("⏱️  SCRIPT EXECUTION TIME")
         print("="*60)
-        if hours > 0:
-            print(f"Total time: {hours}h {minutes}m {seconds}s ({total_duration:.2f} seconds)")
-        elif minutes > 0:
-            print(f"Total time: {minutes}m {seconds}s ({total_duration:.2f} seconds)")
+        
+        # Show session time
+        if sess_hours > 0:
+            print(f"This session: {sess_hours}h {sess_minutes}m {sess_seconds}s ({session_duration:.2f} seconds)")
+        elif sess_minutes > 0:
+            print(f"This session: {sess_minutes}m {sess_seconds}s ({session_duration:.2f} seconds)")
         else:
-            print(f"Total time: {seconds}s ({total_duration:.2f} seconds)")
+            print(f"This session: {sess_seconds}s ({session_duration:.2f} seconds)")
+        
+        # Show cumulative total if there were previous sessions
+        if cumulative_runtime_seconds > 0:
+            if total_hours > 0:
+                print(f"TOTAL TIME (all sessions): {total_hours}h {total_minutes}m {total_seconds}s ({total_duration:.2f} seconds)")
+            elif total_minutes > 0:
+                print(f"TOTAL TIME (all sessions): {total_minutes}m {total_seconds}s ({total_duration:.2f} seconds)")
+            else:
+                print(f"TOTAL TIME (all sessions): {total_seconds}s ({total_duration:.2f} seconds)")
+        
         print("="*60)
 
 def main():
@@ -5113,7 +5201,7 @@ def main_with_auto_retry():
     
     MAX_RETRIES = 5  # Maximum number of automatic restarts
     RETRY_DELAY = 15  # Seconds to wait before restarting
-    SUBPROCESS_TIMEOUT = 3600  # 1 hour timeout per subprocess (prevents hangs)
+    SUBPROCESS_TIMEOUT = 600  # 10 minute timeout per subprocess (prevents hangs)
     
     # Create a wrapper-level error tracker to track subprocess crashes
     wrapper_crashes = []  # List of crash details for summary
@@ -5135,6 +5223,7 @@ def main_with_auto_retry():
     print(f"   Max retries: {MAX_RETRIES}")
     print(f"   Retry delay: {RETRY_DELAY}s")
     print(f"   Subprocess timeout: {SUBPROCESS_TIMEOUT}s ({SUBPROCESS_TIMEOUT//60} min)")
+    print(f"   Per-bet timeout: 300s (5 min)")
     print(f"   Progress file: bet_progress.json")
     print(f"   All crashes will be logged and displayed at end")
     print(f"{'='*60}\n")
@@ -5177,8 +5266,8 @@ def main_with_auto_retry():
         except subprocess.TimeoutExpired:
             # Process hung - need to restart
             exit_code = -1
-            error_reason = f"TIMEOUT (hung for >{SUBPROCESS_TIMEOUT}s)"
-            print(f"\n⚠️ SUBPROCESS TIMEOUT - Process hung for over {SUBPROCESS_TIMEOUT} seconds")
+            error_reason = f"TIMEOUT (hung for >{SUBPROCESS_TIMEOUT}s = {SUBPROCESS_TIMEOUT//60} min)"
+            print(f"\n⚠️ SUBPROCESS TIMEOUT - Process hung for over {SUBPROCESS_TIMEOUT} seconds ({SUBPROCESS_TIMEOUT//60} min)")
             
             # Track this crash
             wrapper_crashes.append({
