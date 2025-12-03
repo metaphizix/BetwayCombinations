@@ -4073,7 +4073,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         print("FINAL TIME VALIDATION")
         print(f"{'='*60}")
         
-        total_bets = num_matches ** 3
+        total_bets = 3 ** num_matches  # 3 outcomes (1, X, 2) per match
         avg_time_per_bet = 7 / 3  # Based on: 3 combinations takes ~7 minutes
         total_time_needed = total_bets * avg_time_per_bet
         estimated_hours = math.ceil(total_time_needed / 60)
