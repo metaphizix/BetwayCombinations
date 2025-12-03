@@ -2307,7 +2307,7 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
             modal_appeared = False
             
             # Helper function to check if confirmation modal appeared
-            async def check_for_modal():
+            async def check_for_modal(check_balance_change=False, pre_click_balance=None):
                 # FIRST: Check if this is an Account Options modal (NOT a bet confirmation)
                 # Account modal has unique identifiers we should exclude
                 account_modal_indicators = [
@@ -2359,6 +2359,18 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             return True
                     except:
                         pass
+                
+                # FALLBACK: Check if balance decreased (bet may have been placed without modal)
+                # This handles the rare case where bet is placed but confirmation modal doesn't show
+                if check_balance_change and pre_click_balance is not None and pre_click_balance > 0:
+                    await page.wait_for_timeout(500)
+                    current_balance = await get_current_balance(page)
+                    if current_balance > 0 and current_balance < pre_click_balance:
+                        balance_diff = pre_click_balance - current_balance
+                        print(f"    ✓ [check_for_modal] BALANCE DECREASED: R{pre_click_balance:.2f} → R{current_balance:.2f} (diff: R{balance_diff:.2f})")
+                        print(f"    ✓ [check_for_modal] Bet appears to have been placed (balance-based detection)")
+                        return True
+                
                 return False
             
             # Helper function to check for and close Account Options modal
@@ -2450,6 +2462,14 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                         continue
                 return None
             
+            # Capture balance BEFORE any click attempts (for balance-based bet detection)
+            pre_click_balance = await get_current_balance(page)
+            if pre_click_balance > 0:
+                print(f"    💰 Pre-click balance: R{pre_click_balance:.2f}")
+            
+            # Track how many times Account modal appears (indicates position problem)
+            account_modal_count = 0
+            
             # Method 1: Scroll into view and JavaScript click
             if not modal_appeared:
                 try:
@@ -2473,9 +2493,10 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     # CRITICAL: Check if Account Options modal appeared instead of bet confirmation
                     account_modal_closed = await check_and_close_account_modal()
                     if account_modal_closed:
+                        account_modal_count += 1
                         print("    ⚠️ Account modal was triggered instead of bet - will retry")
                     
-                    modal_appeared = await check_for_modal()
+                    modal_appeared = await check_for_modal(check_balance_change=True, pre_click_balance=pre_click_balance)
                     if modal_appeared:
                         print("    ✅ Method 1: JavaScript click SUCCESS - modal appeared!")
                         click_success = True
@@ -2495,9 +2516,10 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     # Check for Account Options modal
                     account_modal_closed = await check_and_close_account_modal()
                     if account_modal_closed:
+                        account_modal_count += 1
                         print("    ⚠️ Account modal was triggered instead of bet - will retry")
                     
-                    modal_appeared = await check_for_modal()
+                    modal_appeared = await check_for_modal(check_balance_change=True, pre_click_balance=pre_click_balance)
                     if modal_appeared:
                         print("    ✅ Method 2: Direct click SUCCESS - modal appeared!")
                         click_success = True
@@ -2517,9 +2539,10 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     # Check for Account Options modal
                     account_modal_closed = await check_and_close_account_modal()
                     if account_modal_closed:
+                        account_modal_count += 1
                         print("    ⚠️ Account modal was triggered instead of bet - will retry")
                     
-                    modal_appeared = await check_for_modal()
+                    modal_appeared = await check_for_modal(check_balance_change=True, pre_click_balance=pre_click_balance)
                     if modal_appeared:
                         print("    ✅ Method 3: Dispatch click SUCCESS - modal appeared!")
                         click_success = True
@@ -2541,9 +2564,10 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     # Check for Account Options modal
                     account_modal_closed = await check_and_close_account_modal()
                     if account_modal_closed:
+                        account_modal_count += 1
                         print("    ⚠️ Account modal was triggered instead of bet - will retry")
                     
-                    modal_appeared = await check_for_modal()
+                    modal_appeared = await check_for_modal(check_balance_change=True, pre_click_balance=pre_click_balance)
                     if modal_appeared:
                         print("    ✅ Method 4: Enter key SUCCESS - modal appeared!")
                         click_success = True
@@ -2567,9 +2591,10 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                         # Check for Account Options modal
                         account_modal_closed = await check_and_close_account_modal()
                         if account_modal_closed:
+                            account_modal_count += 1
                             print("    ⚠️ Account modal was triggered instead of bet - will retry")
                         
-                        modal_appeared = await check_for_modal()
+                        modal_appeared = await check_for_modal(check_balance_change=True, pre_click_balance=pre_click_balance)
                         if modal_appeared:
                             print("    ✅ Method 5: Mouse click SUCCESS - modal appeared!")
                             click_success = True
@@ -2577,6 +2602,42 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             print("    ✗ Method 5: Mouse click but no modal appeared")
                 except Exception as e:
                     print(f"    ✗ Method 5 failed: {e}")
+            
+            # If Account modal appeared multiple times, try special recovery method
+            if not modal_appeared and account_modal_count >= 2:
+                print(f"    ⚠️ Account modal appeared {account_modal_count} times - trying special recovery...")
+                try:
+                    # Scroll the betslip container to top to ensure Bet Now button is not near deposit button
+                    betslip_container = await page.query_selector('div#betslip-container-mobile, div#betslip-container')
+                    if betslip_container:
+                        await betslip_container.evaluate('el => el.scrollTop = 0')
+                        await page.wait_for_timeout(500)
+                    
+                    # Scroll page down to push betslip higher
+                    await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    await page.wait_for_timeout(500)
+                    
+                    # Try clicking with explicit button text matching
+                    bet_btn = await page.query_selector('button:has-text("Bet Now"):not(:has-text("deposit")):not(:has-text("Account"))')
+                    if bet_btn and await bet_btn.is_visible() and await bet_btn.is_enabled():
+                        # Get exact bounding box and click center
+                        box = await bet_btn.bounding_box()
+                        if box:
+                            # Click slightly above center to avoid any overlap issues
+                            x = box['x'] + box['width'] / 2
+                            y = box['y'] + box['height'] / 2 - 5  # 5px above center
+                            await page.mouse.click(x, y)
+                            await page.wait_for_timeout(1500)
+                            
+                            # Close any account modal that might appear
+                            await check_and_close_account_modal()
+                            
+                            modal_appeared = await check_for_modal(check_balance_change=True, pre_click_balance=pre_click_balance)
+                            if modal_appeared:
+                                print("    ✅ Special recovery: SUCCESS!")
+                                click_success = True
+                except Exception as e:
+                    print(f"    ✗ Special recovery failed: {e}")
             
             # Method 6: Force page refresh and try again with fresh DOM
             if not modal_appeared:
@@ -2587,6 +2648,9 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     await page.reload(wait_until='domcontentloaded', timeout=15000)
                     await page.wait_for_timeout(2000)
                     await close_all_modals(page)
+                    
+                    # Re-capture balance after reload
+                    pre_click_balance = await get_current_balance(page)
                     
                     # Re-enter the bet amount since page was reloaded
                     stake_input = await page.query_selector('#bet-amount-input')
@@ -2610,7 +2674,11 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                         await page.wait_for_timeout(500)
                         await fresh_btn.click(timeout=3000, force=True)
                         await page.wait_for_timeout(1500)
-                        modal_appeared = await check_for_modal()
+                        
+                        # Close any account modal
+                        await check_and_close_account_modal()
+                        
+                        modal_appeared = await check_for_modal(check_balance_change=True, pre_click_balance=pre_click_balance)
                         if modal_appeared:
                             print("    ✅ Method 6: Reload + click SUCCESS - modal appeared!")
                             click_success = True
@@ -2621,28 +2689,52 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
             
             if not click_success or not modal_appeared:
                 print("    ❌ [ERROR] All click methods failed to trigger modal!")
-                # Try to get button's computed style and state for debugging
-                try:
-                    button_info = await place_bet_btn.evaluate('''el => {
-                        const style = window.getComputedStyle(el);
-                        return {
-                            display: style.display,
-                            visibility: style.visibility,
-                            opacity: style.opacity,
-                            pointerEvents: style.pointerEvents,
-                            zIndex: style.zIndex,
-                            position: style.position,
-                            disabled: el.disabled,
-                            ariaDisabled: el.getAttribute('aria-disabled'),
-                            classList: Array.from(el.classList),
-                            id: el.id,
-                        };
-                    }''')
-                    print(f"    🔍 Button debug info: {button_info}")
-                except:
-                    pass
-                # Return special code to indicate retry needed
-                return "RETRY"
+                
+                # LAST RESORT: Check if balance decreased anyway (bet might have been placed silently)
+                if pre_click_balance > 0:
+                    final_balance = await get_current_balance(page)
+                    if final_balance > 0 and final_balance < pre_click_balance:
+                        balance_diff = pre_click_balance - final_balance
+                        # Check if the difference matches the expected stake (with small tolerance)
+                        if abs(balance_diff - amount) < 0.50:  # Within R0.50 tolerance
+                            print(f"    ✅ [BALANCE CHECK] Bet WAS placed! Balance: R{pre_click_balance:.2f} → R{final_balance:.2f}")
+                            print(f"    ✅ Balance decreased by R{balance_diff:.2f} (expected R{amount:.2f})")
+                            click_success = True
+                            modal_appeared = True  # Treat as success
+                        else:
+                            print(f"    ⚠️ Balance changed by R{balance_diff:.2f} but expected R{amount:.2f}")
+                    else:
+                        print(f"    💰 Final balance check: R{final_balance:.2f} (no decrease from R{pre_click_balance:.2f})")
+                
+                if not click_success:
+                    # Try to get button's computed style and state for debugging
+                    try:
+                        button_info = await place_bet_btn.evaluate('''el => {
+                            const style = window.getComputedStyle(el);
+                            return {
+                                display: style.display,
+                                visibility: style.visibility,
+                                opacity: style.opacity,
+                                pointerEvents: style.pointerEvents,
+                                zIndex: style.zIndex,
+                                position: style.position,
+                                disabled: el.disabled,
+                                ariaDisabled: el.getAttribute('aria-disabled'),
+                                classList: Array.from(el.classList),
+                                id: el.id,
+                            };
+                        }''')
+                        print(f"    🔍 Button debug info: {button_info}")
+                    except:
+                        pass
+                    
+                    # Log the account modal issue if it happened multiple times
+                    if account_modal_count > 0:
+                        print(f"    📝 Account modal appeared {account_modal_count} times during click attempts")
+                        print(f"    📝 This suggests a UI positioning issue - betslip may overlap with account area")
+                    
+                    # Return special code to indicate retry needed
+                    return "RETRY"
             
             print("    ✅ Bet Now button clicked and confirmation modal appeared!")
             
@@ -2754,28 +2846,135 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                 'button[aria-label="Continue betting"]',
                 'button:has-text("Continue betting")',
                 'button.p-button:has-text("Continue betting")',
+                'button:has-text("Continue")',  # Shorter text match
             ]
             
             bet_confirmed = False
+            continue_btn = None
+            
+            # First, find the Continue betting button
             for cont_selector in continue_betting_selectors:
                 try:
                     continue_btn = await page.wait_for_selector(cont_selector, timeout=3000, state='visible')
-                    if continue_btn:
-                        print(f"    ✅ Found 'Continue betting' button - clicking to dismiss modal...")
+                    if continue_btn and await continue_btn.is_visible():
+                        print(f"    ✅ Found 'Continue betting' button using: {cont_selector}")
+                        break
+                except:
+                    continue
+            
+            # If button found, try multiple click methods
+            if continue_btn:
+                print(f"    🖱️ Attempting to click 'Continue betting' button...")
+                click_succeeded = False
+                
+                # Method 1: JavaScript click
+                if not click_succeeded:
+                    try:
                         await continue_btn.scroll_into_view_if_needed()
                         await page.wait_for_timeout(300)
                         await continue_btn.evaluate('el => el.click()')
                         await page.wait_for_timeout(500)
-                        
-                        # Return based on verification result
-                        if verification['success']:
-                            print(f"    ✅ Bet CONFIRMED placed successfully!")
-                            return True
-                        else:
-                            print(f"    ⚠️ Modal found but verification failed - treating as success with caution")
-                            return True
-                except:
-                    continue
+                        # Check if modal closed
+                        still_visible = await page.query_selector('button#strike-conf-continue-btn')
+                        if not still_visible or not await still_visible.is_visible():
+                            click_succeeded = True
+                            print(f"    ✅ Method 1: JavaScript click succeeded")
+                    except Exception as e:
+                        print(f"    ✗ Method 1 (JS click) failed: {e}")
+                
+                # Method 2: Direct Playwright click
+                if not click_succeeded:
+                    try:
+                        # Re-query button in case DOM changed
+                        continue_btn = await page.query_selector('button#strike-conf-continue-btn')
+                        if continue_btn and await continue_btn.is_visible():
+                            await continue_btn.click(timeout=3000, force=True)
+                            await page.wait_for_timeout(500)
+                            still_visible = await page.query_selector('button#strike-conf-continue-btn')
+                            if not still_visible or not await still_visible.is_visible():
+                                click_succeeded = True
+                                print(f"    ✅ Method 2: Direct click succeeded")
+                    except Exception as e:
+                        print(f"    ✗ Method 2 (direct click) failed: {e}")
+                
+                # Method 3: Mouse click at coordinates
+                if not click_succeeded:
+                    try:
+                        continue_btn = await page.query_selector('button#strike-conf-continue-btn')
+                        if continue_btn and await continue_btn.is_visible():
+                            box = await continue_btn.bounding_box()
+                            if box:
+                                x = box['x'] + box['width'] / 2
+                                y = box['y'] + box['height'] / 2
+                                await page.mouse.click(x, y)
+                                await page.wait_for_timeout(500)
+                                still_visible = await page.query_selector('button#strike-conf-continue-btn')
+                                if not still_visible or not await still_visible.is_visible():
+                                    click_succeeded = True
+                                    print(f"    ✅ Method 3: Mouse click succeeded")
+                    except Exception as e:
+                        print(f"    ✗ Method 3 (mouse click) failed: {e}")
+                
+                # Method 4: Dispatch click event
+                if not click_succeeded:
+                    try:
+                        continue_btn = await page.query_selector('button#strike-conf-continue-btn')
+                        if continue_btn and await continue_btn.is_visible():
+                            await continue_btn.dispatch_event('click')
+                            await page.wait_for_timeout(500)
+                            still_visible = await page.query_selector('button#strike-conf-continue-btn')
+                            if not still_visible or not await still_visible.is_visible():
+                                click_succeeded = True
+                                print(f"    ✅ Method 4: Dispatch click succeeded")
+                    except Exception as e:
+                        print(f"    ✗ Method 4 (dispatch) failed: {e}")
+                
+                # Method 5: Press Enter while focused
+                if not click_succeeded:
+                    try:
+                        continue_btn = await page.query_selector('button#strike-conf-continue-btn')
+                        if continue_btn and await continue_btn.is_visible():
+                            await continue_btn.focus()
+                            await page.wait_for_timeout(200)
+                            await page.keyboard.press('Enter')
+                            await page.wait_for_timeout(500)
+                            still_visible = await page.query_selector('button#strike-conf-continue-btn')
+                            if not still_visible or not await still_visible.is_visible():
+                                click_succeeded = True
+                                print(f"    ✅ Method 5: Enter key succeeded")
+                    except Exception as e:
+                        print(f"    ✗ Method 5 (Enter key) failed: {e}")
+                
+                # Method 6: Press Escape to close modal
+                if not click_succeeded:
+                    try:
+                        print(f"    ⚠️ Trying Escape key to close modal...")
+                        await page.keyboard.press('Escape')
+                        await page.wait_for_timeout(500)
+                        still_visible = await page.query_selector('button#strike-conf-continue-btn')
+                        if not still_visible or not await still_visible.is_visible():
+                            click_succeeded = True
+                            print(f"    ✅ Method 6: Escape key closed modal")
+                    except Exception as e:
+                        print(f"    ✗ Method 6 (Escape) failed: {e}")
+                
+                if click_succeeded:
+                    bet_confirmed = True
+                    if verification['success']:
+                        print(f"    ✅ Bet CONFIRMED placed successfully!")
+                        return True
+                    else:
+                        print(f"    ⚠️ Modal closed but verification incomplete - treating as success")
+                        return True
+                else:
+                    print(f"    ⚠️ Could not click 'Continue betting' - modal may still be open")
+                    # Even if we couldn't close the modal, the bet was likely placed
+                    if verification['success']:
+                        print(f"    ✅ Bet was placed (verified) - continuing despite modal issue")
+                        # Try one more time to close with Escape
+                        await page.keyboard.press('Escape')
+                        await page.wait_for_timeout(300)
+                        return True
             
             # If verification succeeded but no continue button found, still return success
             if verification['success'] and verification['confidence'] in ['HIGH', 'MEDIUM']:
@@ -2790,13 +2989,18 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                 bet_conf_modal = await page.query_selector('span:has-text("Bet Confirmation")')
                 if bet_conf_modal:
                     print("    ✅ Found 'Bet Confirmation' modal - bet successful!")
-                    # Try to close the modal using specific selectors only
+                    # Try multiple methods to close the modal
+                    modal_closed = False
+                    
+                    # Method 1: Try clicking Continue betting button with multiple approaches
                     close_selectors = [
-                        'svg#modal-close-btn',  # Specific modal close button
                         'button#strike-conf-continue-btn',  # Continue betting button
+                        'svg#modal-close-btn',  # Specific modal close button
                         'button[aria-label="Close"]',  # Exact match close button
                     ]
                     for close_sel in close_selectors:
+                        if modal_closed:
+                            break
                         try:
                             close_btn = await page.wait_for_selector(close_sel, timeout=2000, state='visible')
                             if close_btn:
@@ -2807,12 +3011,49 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                                         continue
                                 except:
                                     pass
-                                await close_btn.click()
-                                await page.wait_for_timeout(1000)
-                                print("    ✅ Closed confirmation modal")
-                                return True
+                                
+                                # Try multiple click methods
+                                for click_method in ['js', 'direct', 'mouse', 'dispatch']:
+                                    try:
+                                        if click_method == 'js':
+                                            await close_btn.evaluate('el => el.click()')
+                                        elif click_method == 'direct':
+                                            await close_btn.click(force=True)
+                                        elif click_method == 'mouse':
+                                            box = await close_btn.bounding_box()
+                                            if box:
+                                                await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                                        elif click_method == 'dispatch':
+                                            await close_btn.dispatch_event('click')
+                                        
+                                        await page.wait_for_timeout(500)
+                                        # Check if modal closed
+                                        check = await page.query_selector('span:has-text("Bet Confirmation")')
+                                        if not check or not await check.is_visible():
+                                            modal_closed = True
+                                            print(f"    ✅ Modal closed using {close_sel} ({click_method})")
+                                            break
+                                    except:
+                                        continue
                         except:
                             continue
+                    
+                    # Method 2: Try Escape key
+                    if not modal_closed:
+                        try:
+                            await page.keyboard.press('Escape')
+                            await page.wait_for_timeout(500)
+                            check = await page.query_selector('span:has-text("Bet Confirmation")')
+                            if not check or not await check.is_visible():
+                                modal_closed = True
+                                print(f"    ✅ Modal closed using Escape key")
+                        except:
+                            pass
+                    
+                    # Even if modal didn't close, bet was placed
+                    if not modal_closed:
+                        print(f"    ⚠️ Could not close confirmation modal - but bet was placed")
+                    
                     return True
             except:
                 pass
