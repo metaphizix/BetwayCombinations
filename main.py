@@ -5772,10 +5772,10 @@ def main_with_auto_retry():
     MAX_RETRIES = 5  # Maximum number of automatic restarts
     RETRY_DELAY = 15  # Seconds to wait before restarting
     # Timeout is for TOTAL runtime, not inactivity. Each bet can take 2+ min with delays.
-    # For 243 bets at ~2min each = ~8 hours. Set to 86 hours to handle week-long operations.
+    # For 243 bets at ~2min each = ~8 hours. Set to 200 hours to handle week-long operations.
     # CRITICAL: Previously this was set to 420 seconds (7 min) which caused hangs!
     # Individual operations have their own timeouts (15-30s), this is for total process.
-    SUBPROCESS_TIMEOUT = 309600  # 86 hour timeout (309600 seconds) = 5160 minutes
+    SUBPROCESS_TIMEOUT = 720000  # 200 hour timeout (720000 seconds) = 12000 minutes
     
     # Create a wrapper-level error tracker to track subprocess crashes
     wrapper_crashes = []  # List of crash details for summary

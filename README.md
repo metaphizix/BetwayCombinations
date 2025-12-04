@@ -283,7 +283,7 @@ This will:
 9. **Termination on failure** - Application stops completely if any bet fails (check logs for details)
 10. **Error logging** - All errors saved to `error_log.json` using RFC 7807 Problem Details format
 11. **Automatic cleanup** - On successful completion, both `bet_progress.json` and `error_log.json` are deleted
-12. **86-hour timeout** - Subprocess timeout set to 86 hours to support week-long operations without hanging
+12. **200-hour timeout** - Subprocess timeout set to 200 hours to support week-long operations without hanging
 
 ## Calculation Table
 
@@ -366,7 +366,7 @@ When running in CLI mode, the script includes an auto-retry wrapper:
 - **Memory cleanup** - Fresh memory state prevents Playwright corruption
 - **Progress preservation** - Resumes from last saved bet on restart
 - **Configurable retries** - Up to 5 automatic restarts (configurable)
-- **Timeout protection** - 86-hour timeout per subprocess prevents hangs (supports week-long operations)
+- **Timeout protection** - 200-hour timeout per subprocess prevents hangs (supports week-long operations)
 - **Crash logging** - All crashes tracked and summarized at end
 
 Example:
