@@ -140,12 +140,13 @@ The system workflow:
 8. **Anti-Detection Features**:
 
    - Random delays between bets (5s base + 10-60s random)
-   - **Browser restart every 10 bets** (creates fresh browser instance)
+   - **Browser restart every 8 bets** (creates fresh browser instance)
    - **Page refresh every 5 bets** (clears DOM state)
    - Garbage collection after each bet
    - Human-like behavior patterns
 
 9. **Termination on Failure**: If any bet fails, the entire application stops immediately
+10. **Success Cleanup**: On successful completion, both `bet_progress.json` and `error_log.json` are automatically deleted
 
 ## Setup
 
@@ -235,7 +236,7 @@ This will:
 ### Anti-Detection
 
 - **Random delays** - Adds 10-60 second random waits between bets
-- **Browser restarts** - Creates fresh browser instance every 10 bets
+- **Browser restarts** - Creates fresh browser instance every 8 bets
 - **Page refreshes** - Clears DOM state every 5 bets
 - **Garbage collection** - Memory cleanup after each bet
 - **Variable timing** - Mimics human-like behavior
@@ -281,6 +282,8 @@ This will:
 8. **Pagination** - Automatically clicks "Next" button to load more matches as needed
 9. **Termination on failure** - Application stops completely if any bet fails (check logs for details)
 10. **Error logging** - All errors saved to `error_log.json` using RFC 7807 Problem Details format
+11. **Automatic cleanup** - On successful completion, both `bet_progress.json` and `error_log.json` are deleted
+12. **86-hour timeout** - Subprocess timeout set to 86 hours to support week-long operations without hanging
 
 ## Calculation Table
 
@@ -363,7 +366,7 @@ When running in CLI mode, the script includes an auto-retry wrapper:
 - **Memory cleanup** - Fresh memory state prevents Playwright corruption
 - **Progress preservation** - Resumes from last saved bet on restart
 - **Configurable retries** - Up to 5 automatic restarts (configurable)
-- **Timeout protection** - 1-hour timeout per subprocess prevents hangs
+- **Timeout protection** - 86-hour timeout per subprocess prevents hangs (supports week-long operations)
 - **Crash logging** - All crashes tracked and summarized at end
 
 Example:

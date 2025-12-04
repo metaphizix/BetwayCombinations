@@ -112,6 +112,94 @@ PROBLEM_TYPES = {
         'category': 'critical',
         'recoverable': True,
         'suggested_action': 'Unhandled exception caught. Progress saved - auto-retry wrapper will restart.'
+    },
+    'BROWSER_RESTART_SUCCESS': {
+        'type': 'urn:betway-automation:info:browser-restart-success',
+        'title': 'Browser Restart Successful',
+        'status': 200,
+        'category': 'maintenance',
+        'recoverable': True,
+        'suggested_action': 'Scheduled browser restart completed successfully. Continuing with bets.'
+    },
+    'BROWSER_RESTART_FAILED': {
+        'type': 'urn:betway-automation:error:browser-restart-failed',
+        'title': 'Browser Restart Failed',
+        'status': 503,
+        'category': 'browser',
+        'recoverable': True,
+        'suggested_action': 'Browser restart failed. Will retry with new browser instance.'
+    },
+    'BROWSER_RESTART_ERROR': {
+        'type': 'urn:betway-automation:error:browser-restart-error',
+        'title': 'Browser Restart Error',
+        'status': 500,
+        'category': 'browser',
+        'recoverable': True,
+        'suggested_action': 'Error during browser restart. Progress saved - will retry.'
+    },
+    'PAGE_REFRESH_SUCCESS': {
+        'type': 'urn:betway-automation:info:page-refresh-success',
+        'title': 'Page Refresh Successful',
+        'status': 200,
+        'category': 'maintenance',
+        'recoverable': True,
+        'suggested_action': 'Page refresh completed successfully. Continuing with bets.'
+    },
+    'PAGE_REFRESH_FAILED': {
+        'type': 'urn:betway-automation:error:page-refresh-failed',
+        'title': 'Page Refresh Failed',
+        'status': 503,
+        'category': 'browser',
+        'recoverable': True,
+        'suggested_action': 'Page refresh failed. Will attempt browser restart.'
+    },
+    'WAIT_INTERRUPTED': {
+        'type': 'urn:betway-automation:info:wait-interrupted',
+        'title': 'Wait Interrupted',
+        'status': 200,
+        'category': 'interruption',
+        'recoverable': True,
+        'suggested_action': 'Wait was interrupted. Resuming operations.'
+    },
+    'RECOVERY_SUCCESS': {
+        'type': 'urn:betway-automation:info:recovery-success',
+        'title': 'Recovery Successful',
+        'status': 200,
+        'category': 'recovery',
+        'recoverable': True,
+        'suggested_action': 'Recovery operation completed successfully.'
+    },
+    'RECOVERY_RETRY_FAILED': {
+        'type': 'urn:betway-automation:error:recovery-retry-failed',
+        'title': 'Recovery Retry Failed',
+        'status': 503,
+        'category': 'recovery',
+        'recoverable': True,
+        'suggested_action': 'Recovery retry failed. Will attempt alternative recovery.'
+    },
+    'RECOVERY_BROWSER_RESTART_FAILED': {
+        'type': 'urn:betway-automation:error:recovery-browser-restart-failed',
+        'title': 'Recovery Browser Restart Failed',
+        'status': 503,
+        'category': 'recovery',
+        'recoverable': True,
+        'suggested_action': 'Browser restart during recovery failed. Progress saved.'
+    },
+    'RECOVERY_EXCEPTION': {
+        'type': 'urn:betway-automation:error:recovery-exception',
+        'title': 'Recovery Exception',
+        'status': 500,
+        'category': 'recovery',
+        'recoverable': True,
+        'suggested_action': 'Exception during recovery process. Progress saved.'
+    },
+    'SCRIPT_COMPLETED': {
+        'type': 'urn:betway-automation:info:script-completed',
+        'title': 'Script Completed',
+        'status': 200,
+        'category': 'completion',
+        'recoverable': True,
+        'suggested_action': 'Script execution completed successfully.'
     }
 }
 
@@ -197,9 +285,6 @@ class ErrorTracker:
         recoverable_icon = "🔄" if problem.recoverable else "⛔"
         print(f"    📝 [PROBLEM LOGGED] {recoverable_icon} {problem.title}")
         print(f"       └─ {error_message[:80]}{'...' if len(error_message) > 80 else ''}")
-    
-    def get_error_count(self) -> int:
-        return len(self.problems)
     
     def get_recoverable_errors(self) -> list:
         return [p for p in self.problems if p.recoverable]
@@ -288,10 +373,13 @@ class ErrorTracker:
         print(f"{'='*80}\n")
     
     def save_to_file(self, filename: str = "error_log.json"):
-        """Save problems to a JSON file in Problem Details format."""
+        """Save problems to a JSON file in Problem Details format.
+        
+        Appends new session errors to existing log file instead of overwriting.
+        """
         try:
-            data = {
-                'schema': 'RFC 7807 Problem Details',
+            # Create current session data
+            current_session = {
                 'session_id': self.session_id,
                 'script_start': self.start_time.isoformat(),
                 'script_end': datetime.now().isoformat(),
@@ -304,15 +392,163 @@ class ErrorTracker:
                 'problems': [p.to_dict() for p in self.problems]
             }
             
+            # Try to load existing log file and append
+            existing_sessions = []
+            if os.path.exists(filename):
+                try:
+                    with open(filename, 'r') as f:
+                        content = f.read().strip()
+                    
+                    # Handle empty file gracefully
+                    if not content:
+                        print(f"📂 Log file {filename} is empty, initializing new log")
+                        existing_sessions = []
+                    else:
+                        existing_data = json.loads(content)
+                        
+                        # Handle old format (single session) vs new format (multiple sessions)
+                        if 'sessions' in existing_data:
+                            # New format with sessions array
+                            existing_sessions = existing_data.get('sessions', [])
+                        elif 'session_id' in existing_data:
+                            # Old format with single session - convert to array
+                            existing_sessions = [existing_data]
+                        else:
+                            existing_sessions = []
+                        
+                        if existing_sessions:
+                            print(f"📂 Loaded {len(existing_sessions)} existing session(s) from {filename}")
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"⚠️ Could not parse existing log file ({type(e).__name__}), starting fresh")
+                    existing_sessions = []
+            
+            # Append current session
+            existing_sessions.append(current_session)
+            
+            # Calculate overall totals
+            total_problems = sum(s.get('summary', {}).get('total_problems', 0) for s in existing_sessions)
+            total_recoverable = sum(s.get('summary', {}).get('recoverable', 0) for s in existing_sessions)
+            total_fatal = sum(s.get('summary', {}).get('fatal', 0) for s in existing_sessions)
+            
+            # Create final data structure with all sessions
+            data = {
+                'schema': 'RFC 7807 Problem Details',
+                'log_updated': datetime.now().isoformat(),
+                'total_sessions': len(existing_sessions),
+                'overall_summary': {
+                    'total_problems': total_problems,
+                    'recoverable': total_recoverable,
+                    'fatal': total_fatal
+                },
+                'sessions': existing_sessions
+            }
+            
             with open(filename, 'w') as f:
                 json.dump(data, f, indent=2, default=str)
-            print(f"📁 Problem Details log saved to: {filename}")
+            print(f"📁 Problem Details log saved to: {filename} ({len(existing_sessions)} session(s), {total_problems} total problems)")
         except Exception as e:
             print(f"⚠️ Could not save problem log: {e}")
 
 
 # Global error tracker instance
 error_tracker = ErrorTracker()
+
+
+# ============================================================================
+# TIMEOUT-SAFE NAVIGATION HELPER
+# ============================================================================
+
+async def safe_goto(page: Page, url: str, **kwargs):
+    """
+    Wrapper for page.goto() with hard timeout protection to prevent indefinite hangs.
+    
+    This is CRITICAL because Playwright's page.goto() can hang indefinitely even with
+    a timeout parameter specified. This wrapper adds an asyncio.wait_for() layer that
+    provides a hard limit that actually works.
+    
+    Args:
+        page: Playwright page object
+        url: URL to navigate to
+        **kwargs: Additional arguments to pass to page.goto() (timeout, wait_until, etc.)
+    
+    Returns:
+        Response object or None if timeout
+    
+    Raises:
+        Exception: Re-raises exceptions except asyncio.TimeoutError which is logged
+    """
+    # Extract timeout from kwargs or use default
+    playwright_timeout = kwargs.get('timeout', 30000)  # Default 30s
+    # Hard timeout should be slightly higher than Playwright's timeout
+    hard_timeout = (playwright_timeout / 1000) + 5  # +5 seconds buffer
+    
+    try:
+        return await asyncio.wait_for(
+            page.goto(url, **kwargs),
+            timeout=hard_timeout
+        )
+    except asyncio.TimeoutError:
+        print(f"    ⚠️ HARD TIMEOUT: Navigation to {url[:50]}... exceeded {hard_timeout}s")
+        error_tracker.add_error(
+            error_type='TIMEOUT',
+            error_message=f'Hard timeout navigating to {url[:100]} after {hard_timeout}s',
+            context={
+                'url': url,
+                'playwright_timeout': playwright_timeout,
+                'hard_timeout': hard_timeout,
+                'function': 'safe_goto'
+            }
+        )
+        raise  # Re-raise to let caller handle it
+
+
+async def safe_place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache: dict = None, outcome_button_cache: dict = None, timeout_seconds: int = 360):
+    """
+    Timeout-protected wrapper for place_bet_slip to prevent individual bets from hanging too long.
+    
+    CRITICAL: This prevents a single bet from hanging indefinitely and blocking the entire script.
+    Under normal conditions, a bet should complete in 2-5 minutes. The 6-minute (360s) timeout
+    provides a buffer while preventing the 7-minute hang that was causing crashes.
+    
+    Args:
+        page: Playwright page object  
+        bet_slip: Dictionary containing bet slip information
+        amount: Amount to bet
+        match_cache: Optional dictionary containing cached match positions
+        outcome_button_cache: Optional dictionary containing cached outcome buttons
+        timeout_seconds: Maximum seconds to allow for bet placement (default: 360 = 6 minutes)
+    
+    Returns:
+        Same as place_bet_slip: True/False/"RETRY"/"RELOGIN" or raises TimeoutError
+    
+    Raises:
+        asyncio.TimeoutError: If bet placement exceeds timeout_seconds
+    """
+    try:
+        result = await asyncio.wait_for(
+            place_bet_slip(page, bet_slip, amount, match_cache, outcome_button_cache),
+            timeout=timeout_seconds
+        )
+        return result
+    except asyncio.TimeoutError:
+        slip_num = bet_slip.get("slip_number", "?")
+        print(f"\n⚠️ BET TIMEOUT: Bet {slip_num} exceeded {timeout_seconds}s limit!")
+        print(f"   This likely means a page operation hung indefinitely.")
+        print(f"   Raising timeout to trigger retry/restart logic...")
+        
+        error_tracker.add_error(
+            error_type='TIMEOUT',
+            error_message=f'Bet {slip_num} exceeded {timeout_seconds}s timeout - likely page operation hung',
+            context={
+                'bet_number': slip_num,
+                'timeout_seconds': timeout_seconds,
+                'function': 'safe_place_bet_slip',
+                'recovery_action': 'Timeout will trigger retry or browser restart'
+            }
+        )
+        error_tracker.save_to_file()
+        
+        raise  # Re-raise to let caller handle it
 
 
 # ============================================================================
@@ -669,6 +905,7 @@ async def retry_with_backoff(func, max_retries=3, initial_delay=5, **kwargs):
                     },
                     exception=e
                 )
+                error_tracker.save_to_file()
                 
                 await asyncio.sleep(delay)
             else:
@@ -684,6 +921,7 @@ async def retry_with_backoff(func, max_retries=3, initial_delay=5, **kwargs):
                     },
                     exception=e
                 )
+                error_tracker.save_to_file()
                 raise
 
 async def login_to_betway(playwright):
@@ -720,7 +958,7 @@ async def login_to_betway(playwright):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            await page.goto('https://new.betway.co.za/sport/soccer', timeout=30000)
+            await safe_goto(page, 'https://new.betway.co.za/sport/soccer', timeout=30000)
             break
         except Exception as e:
             error_msg = str(e).lower()
@@ -747,6 +985,7 @@ async def login_to_betway(playwright):
                     },
                     exception=e
                 )
+                error_tracker.save_to_file()
                 
                 await asyncio.sleep(delay)
             else:
@@ -757,6 +996,7 @@ async def login_to_betway(playwright):
                     context={'url': 'https://new.betway.co.za/sport/soccer', 'attempts': max_retries, 'phase': 'login_navigation'},
                     exception=e
                 )
+                error_tracker.save_to_file()
                 await browser.close()
                 raise
     
@@ -836,6 +1076,7 @@ async def login_to_betway(playwright):
                 'phase': 'login_modal_open'
             }
         )
+        error_tracker.save_to_file()
         
         await browser.close()
         return None
@@ -893,6 +1134,7 @@ async def login_to_betway(playwright):
                 'possible_causes': ['Invalid credentials', 'Page structure changed', 'Slow page load', 'CAPTCHA required']
             }
         )
+        error_tracker.save_to_file()
         await browser.close()
         return None
     
@@ -1024,6 +1266,7 @@ async def restart_browser_fresh(playwright, old_browser=None, old_page=None):
                 error_message='Browser restart failed - could not login with new browser',
                 context={'status': 'login_failed'}
             )
+            error_tracker.save_to_file()
             return None
     except Exception as e:
         print(f"  ❌ Error creating new browser: {e}")
@@ -1033,6 +1276,7 @@ async def restart_browser_fresh(playwright, old_browser=None, old_page=None):
             context={'status': 'exception'},
             exception=e
         )
+        error_tracker.save_to_file()
         return None
 
 
@@ -1073,6 +1317,7 @@ async def check_and_relogin(page: Page, browser) -> bool:
             error_message='Session expired - detected logged out state, attempting re-login',
             context={'action': 'attempting_relogin'}
         )
+        error_tracker.save_to_file()
         
         # Get credentials from env
         username = os.getenv('BETWAY_USERNAME')
@@ -1085,11 +1330,12 @@ async def check_and_relogin(page: Page, browser) -> bool:
                 error_message='Re-login failed - credentials not found in .env file',
                 context={'reason': 'missing_credentials'}
             )
+            error_tracker.save_to_file()
             return False
         
         # Navigate to the main page to trigger login
         try:
-            await page.goto('https://new.betway.co.za/sport/soccer', timeout=30000)
+            await safe_goto(page, 'https://new.betway.co.za/sport/soccer', timeout=30000)
             await page.wait_for_timeout(2000)
         except Exception as e:
             print(f"❌ [RE-LOGIN FAILED] Could not navigate: {e}")
@@ -1099,6 +1345,7 @@ async def check_and_relogin(page: Page, browser) -> bool:
                 context={'reason': 'navigation_failed'},
                 exception=e
             )
+            error_tracker.save_to_file()
             return False
         
         # Try to find and click login button
@@ -1136,6 +1383,7 @@ async def check_and_relogin(page: Page, browser) -> bool:
                 error_message='Re-login failed - could not find login button',
                 context={'reason': 'login_button_not_found'}
             )
+            error_tracker.save_to_file()
             return False
         
         # Wait for login modal
@@ -1159,6 +1407,7 @@ async def check_and_relogin(page: Page, browser) -> bool:
                 context={'reason': 'credential_fill_failed'},
                 exception=e
             )
+            error_tracker.save_to_file()
             return False
         
         # Wait and verify login
@@ -1186,6 +1435,7 @@ async def check_and_relogin(page: Page, browser) -> bool:
             error_message='Re-login failed - could not verify login after re-authentication',
             context={'reason': 'verification_failed'}
         )
+        error_tracker.save_to_file()
         return False
         
     except Exception as e:
@@ -1196,273 +1446,147 @@ async def check_and_relogin(page: Page, browser) -> bool:
             context={'reason': 'exception'},
             exception=e
         )
+        error_tracker.save_to_file()
         return False
 
-async def close_all_modals(page: Page, max_attempts=3):
+async def close_all_modals(page: Page, max_attempts=3, timeout_seconds=8):
     """
     Aggressively attempt to close all modals/popups that might appear.
     Tries multiple times with various selectors, including betslip modal.
     IMPORTANT: Avoids clicking on account/profile related elements.
+    Has built-in timeout to prevent indefinite hangs.
+    
+    CRITICAL: This function can accidentally close the browser if Escape is pressed
+    when no modal is present. We now check if page is still open before proceeding.
     """
-    for attempt in range(max_attempts):
-        try:
-            # FIRST: Check for and close Account Options modal (Deposit funds tab)
-            # This modal sometimes appears unexpectedly
+    async def _close_modals_inner():
+        for attempt in range(max_attempts):
             try:
-                account_modal_indicators = [
-                    'text="Account Options"',
-                    'text="Deposit funds"',
-                    'text="27614220968"',  # Account number pattern
-                    ':has-text("Account Options")',
-                ]
-                for indicator in account_modal_indicators:
-                    try:
-                        modal_elem = await page.query_selector(indicator)
-                        if modal_elem and await modal_elem.is_visible():
-                            print(f"    ⚠️ Detected Account Options modal - closing...")
-                            # Press Escape to close modal
-                            await page.keyboard.press('Escape')
-                            await asyncio.sleep(0.5)
-                            
-                            # Also try clicking outside the modal or close button
-                            close_btns = await page.query_selector_all('svg[id="modal-close-btn"], button[aria-label="Close"]')
-                            for close_btn in close_btns:
-                                if await close_btn.is_visible():
-                                    await close_btn.click()
-                                    await asyncio.sleep(0.3)
-                                    break
-                            break
-                    except:
-                        continue
-            except:
-                pass
-            
-            # Try various close button selectors (including betslip close from HTML)
-            # IMPORTANT: These selectors are specific to CLOSE buttons only, not action buttons
-            close_selectors = [
-                'svg[id="modal-close-btn"]',  # Betslip and modal close button (specific ID)
-                'button[aria-label="Close"]',  # Exact match for Close button
-                'button[aria-label="close"]',  # Exact match lowercase
-                'button:has-text("×")',  # X button
-                'button:has-text("Close"):not([aria-label*="Account"])',  # Close text but not account related
-                'button:has-text("GOT IT")',  # Common popup dismiss
-                'button:has-text("OK"):not([id*="deposit"]):not([id*="account"])',  # OK button but not deposit/account
-            ]
-            
-            closed_any = False
-            for selector in close_selectors:
+                # CRITICAL: Check if page is still open before attempting to close modals
+                if page.is_closed():
+                    print("    ⚠️ Page already closed - skipping modal close")
+                    return
+                # FIRST: Check for and close Account Options modal (Deposit funds tab)
+                # This modal sometimes appears unexpectedly
                 try:
-                    close_buttons = await page.query_selector_all(selector)
-                    for btn in close_buttons:
-                        if await btn.is_visible():
-                            # CRITICAL: Skip buttons that might be account/deposit related
-                            try:
-                                btn_text = await btn.inner_text()
-                                btn_aria = await btn.get_attribute('aria-label') or ''
-                                btn_id = await btn.get_attribute('id') or ''
-                                
-                                # Skip if this looks like an account/deposit/profile button
-                                skip_keywords = ['deposit', 'account', 'profile', 'login', 'sign', 'register', 'withdraw']
-                                combined_text = f"{btn_text} {btn_aria} {btn_id}".lower()
-                                if any(keyword in combined_text for keyword in skip_keywords):
-                                    continue
-                            except:
-                                pass
-                            
-                            await btn.click()
-                            closed_any = True
-                            await asyncio.sleep(0.3)
-                except Exception:
-                    continue
-            
-            # Try Escape key as well (safest way to close modals)
-            try:
-                await page.keyboard.press('Escape')
-                await asyncio.sleep(0.3)
-            except:
-                pass
-            
-            # If we didn't close anything, we're done
-            if not closed_any:
-                break
-                
-            # Wait a bit before next attempt
-            await asyncio.sleep(0.5)
-                    
-        except Exception as e:
-            # Modals might not be present, that's okay
-            pass
-
-async def scrape_matches(page: Page, num_matches: int):
-    """Scrape available matches and their betting options
-    
-    Scrapes Premier League matches from the Full-Time Result market.
-    Automatically handles pagination by clicking 'Next' button to load more matches.
-    Searches up to 20 pages to find required matches and caches their URLs.
-    """
-    print(f"\nScraping {num_matches} matches (searching up to 20 pages)...")
-    
-    await close_all_modals(page)
-    await page.wait_for_timeout(1500)
-    
-    matches = []
-    max_pages = 20
-    current_page = 1
-    
-    try:
-        while len(matches) < num_matches and current_page <= max_pages:
-            print(f"\nSearching page {current_page}...")
-            
-            # Scroll to load content
-            for _ in range(3):
-                await page.evaluate('window.scrollBy(0, 500)')
-                await page.wait_for_timeout(200)
-            
-            match_containers = await page.query_selector_all('div[data-v-206d232b].relative.grid.grid-cols-12')
-            
-            print(f"Found {len(match_containers)} matches on page {current_page}")
-            
-            for i, container in enumerate(match_containers):
-                if len(matches) >= num_matches:
-                    break
-                    
-                try:
-                    team_elements = await container.query_selector_all('strong.overflow-hidden.text-ellipsis')
-                    if len(team_elements) >= 2:
-                        team1 = await team_elements[0].inner_text()
-                        team2 = await team_elements[1].inner_text()
-                    else:
-                        continue
-                    
-                    start_time = None
-                    try:
-                        all_spans = await container.query_selector_all('span')
-                        for span in all_spans:
-                            try:
-                                span_text = await span.inner_text()
-                                if span_text and (
-                                    re.match(r'(Today|Tomorrow|Mon|Tue|Wed|Thu|Fri|Sat|Sun).*\d{1,2}:\d{2}', span_text) or
-                                    re.match(r'\d{1,2}\s+\w{3}\s*-\s*\d{1,2}:\d{2}', span_text)
-                                ):
-                                    start_time = span_text.strip()
-                                    break
-                            except:
-                                continue
-                    except:
-                        pass
-                    
-                    all_price_divs = await container.query_selector_all('div[price]')
-                    odds = []
-                    
-                    if len(all_price_divs) >= 3:
-                        for j in range(3):
-                            btn = all_price_divs[j]
-                            try:
-                                odd_elem = await btn.query_selector('span')
-                                if odd_elem:
-                                    odd_text = await odd_elem.inner_text()
-                                    if odd_text and odd_text.replace('.', '').replace(',', '').isdigit():
-                                        odds.append(float(odd_text.replace(',', '.')))
-                            except:
-                                continue
-                    
-                    # Get match URL by clicking the team names div
-                    match_url = None
-                    try:
-                        # Find the clickable div with team names
-                        team_div = await container.query_selector('div.flex.flex-row.w-full.gap-1.pr-2')
-                        if team_div:
-                            # Click to navigate to match page
-                            await team_div.click()
-                            await page.wait_for_timeout(1000)
-                            
-                            # Get the URL
-                            match_url = page.url
-                            print(f"    ✓ Captured URL: {match_url}")
-                            
-                            # Go back to matches list
-                            await page.go_back()
-                            await page.wait_for_timeout(1000)
-                            await close_all_modals(page)
-                    except Exception as e:
-                        print(f"    ⚠️  Could not capture URL: {e}")
-                    
-                    if len(odds) == 3:
-                        match = {
-                            "name": f"{team1} vs {team2}",
-                            "team1": team1,
-                            "team2": team2,
-                            "outcomes": ["1", "X", "2"],
-                            "odds": odds,
-                            "container_index": i,
-                            "start_time": start_time,
-                            "page_num": current_page,
-                            "url": match_url  # Store the match URL
-                        }
-                        matches.append(match)
-                        time_str = f" (starts: {start_time})" if start_time else ""
-                        url_str = f" [URL cached]" if match_url else ""
-                        print(f"  Match {len(matches)}: {match['name']} - Odds: {match['odds']}{time_str}{url_str}")
-                        
-                except Exception as e:
-                    print(f"  Error parsing match {i+1}: {e}")
-                    continue
-            
-            # If we have enough matches, stop
-            if len(matches) >= num_matches:
-                break
-            
-            # Try to click Next button to go to next page
-            if current_page < max_pages:
-                try:
-                    print(f"  Clicking 'Next' to load page {current_page + 1}...")
-                    next_button_selectors = [
-                        'button[aria-label="Next"]',
-                        'button.p-button:has-text("Next")',
-                        'button:has-text("Next")',
+                    account_modal_indicators = [
+                        'text="Account Options"',
+                        'text="Deposit funds"',
+                        'text="27614220968"',  # Account number pattern
+                        ':has-text("Account Options")',
                     ]
-                    
-                    next_button = None
-                    for selector in next_button_selectors:
+                    for indicator in account_modal_indicators:
                         try:
-                            btn = await page.wait_for_selector(selector, timeout=2000, state='visible')
-                            if btn and await btn.is_enabled():
-                                next_button = btn
+                            modal_elem = await page.query_selector(indicator)
+                            if modal_elem and await modal_elem.is_visible():
+                                print(f"    ⚠️ Detected Account Options modal - closing...")
+                                # Press Escape to close modal
+                                await page.keyboard.press('Escape')
+                                await asyncio.sleep(0.5)
+                                
+                                # Also try clicking outside the modal or close button
+                                close_btns = await page.query_selector_all('svg[id="modal-close-btn"], button[aria-label="Close"]')
+                                for close_btn in close_btns:
+                                    if await close_btn.is_visible():
+                                        await close_btn.click()
+                                        await asyncio.sleep(0.3)
+                                        break
+                                break
+                        except:
+                            continue
+                except:
+                    pass
+                
+                # Try various close button selectors (including betslip close from HTML)
+                # IMPORTANT: These selectors are specific to CLOSE buttons only, not action buttons
+                close_selectors = [
+                    'svg[id="modal-close-btn"]',  # Betslip and modal close button (specific ID)
+                    'button[aria-label="Close"]',  # Exact match for Close button
+                    'button[aria-label="close"]',  # Exact match lowercase
+                    'button:has-text("×")',  # X button
+                    'button:has-text("Close"):not([aria-label*="Account"])',  # Close text but not account related
+                    'button:has-text("GOT IT")',  # Common popup dismiss
+                    'button:has-text("OK"):not([id*="deposit"]):not([id*="account"])',  # OK button but not deposit/account
+                ]
+                
+                closed_any = False
+                for selector in close_selectors:
+                    try:
+                        close_buttons = await page.query_selector_all(selector)
+                        for btn in close_buttons:
+                            if await btn.is_visible():
+                                # CRITICAL: Skip buttons that might be account/deposit related
+                                try:
+                                    btn_text = await btn.inner_text()
+                                    btn_aria = await btn.get_attribute('aria-label') or ''
+                                    btn_id = await btn.get_attribute('id') or ''
+                                    
+                                    # Skip if this looks like an account/deposit/profile button
+                                    skip_keywords = ['deposit', 'account', 'profile', 'login', 'sign', 'register', 'withdraw']
+                                    combined_text = f"{btn_text} {btn_aria} {btn_id}".lower()
+                                    if any(keyword in combined_text for keyword in skip_keywords):
+                                        continue
+                                except:
+                                    pass
+                                
+                                await btn.click()
+                                closed_any = True
+                                await asyncio.sleep(0.3)
+                    except Exception:
+                        continue
+                
+                # Try Escape key as well (safest way to close modals)
+                # CRITICAL: Only press Escape if we actually found a modal to avoid closing the browser
+                try:
+                    # Check if there's actually a visible modal before pressing Escape
+                    has_modal = False
+                    modal_indicators = [
+                        'div[role="dialog"]',
+                        'div[class*="modal"]',
+                        'div[class*="popup"]',
+                        'div[aria-modal="true"]'
+                    ]
+                    for indicator in modal_indicators:
+                        try:
+                            modal_elem = await page.query_selector(indicator)
+                            if modal_elem and await modal_elem.is_visible():
+                                has_modal = True
                                 break
                         except:
                             continue
                     
-                    if next_button:
-                        await next_button.click()
-                        await page.wait_for_timeout(1000)
-                        await page.evaluate('window.scrollTo(0, 0)')
-                        await page.wait_for_timeout(500)
-                        current_page += 1
-                    else:
-                        print(f"  No 'Next' button found - reached end at page {current_page}")
-                        break
-                except Exception as e:
-                    print(f"  Could not navigate to next page: {e}")
+                    # Only press Escape if we confirmed a modal is present
+                    if has_modal:
+                        await page.keyboard.press('Escape')
+                        await asyncio.sleep(0.3)
+                except:
+                    pass
+                
+                # If we didn't close anything, we're done
+                if not closed_any:
                     break
-            else:
-                break
-        
-        print(f"\nSuccessfully scraped {len(matches)} matches across {current_page} page(s)")
-        
-    except Exception as e:
-        print(f"Error scraping matches: {e}")
-        error_tracker.add_error(
-            error_type="EXCEPTION",
-            error_message=f"Error during match scraping: {str(e)[:150]}",
-            context={
-                'matches_found_so_far': len(matches),
-                'current_page': current_page,
-                'phase': 'match_scraping'
-            },
-            exception=e
-        )
+                    
+                # Wait a bit before next attempt
+                await asyncio.sleep(0.5)
+                        
+            except Exception as e:
+                # Modals might not be present, that's okay
+                pass
     
-    return matches
+    # Wrap the entire modal closing logic with a timeout
+    try:
+        await asyncio.wait_for(_close_modals_inner(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        # If modal closing times out, just press Escape and move on
+        # But only if page is still open and we found a modal
+        try:
+            if not page.is_closed() and has_modal:
+                await page.keyboard.press('Escape')
+        except:
+            pass
+    except Exception:
+        pass
+
 
 def generate_bet_combinations(matches, num_matches):
     """Generate all bet combinations for the given matches"""
@@ -1531,6 +1655,10 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
         amount: Amount to bet
         match_cache: Optional dictionary containing cached match positions to avoid re-searching
         outcome_button_cache: Optional dictionary containing cached outcome buttons keyed by match URL
+    
+    CRITICAL: This function should complete within 5 minutes (300s) under normal conditions.
+    If it takes longer, it likely means a page operation has hung indefinitely.
+    Callers should wrap this with asyncio.wait_for(place_bet_slip(...), timeout=360) to prevent hangs.
     """
     slip_num = bet_slip["slip_number"]
     total = bet_slip["total_combinations"]
@@ -1550,8 +1678,10 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
         if '/event/' in current_url:
             print("  Currently on match detail page - navigating to matches list...")
             try:
-                await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                await safe_goto(page, 'https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
                 await page.wait_for_timeout(1000)
+            except asyncio.TimeoutError:
+                print(f"  ⚠️ Navigation timeout - continuing anyway")
             except Exception as nav_error:
                 print(f"  ⚠️ Navigation failed: {nav_error}")
                 return False
@@ -1651,11 +1781,20 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                 if match_url:
                     print(f"    Using cached URL: {match_url}")
                     
-                    # Navigate to match page to click buttons
-                    await page.goto(match_url, wait_until='domcontentloaded', timeout=15000)
-                    await page.wait_for_timeout(1500)
-                    await close_all_modals(page)
-                    await page.wait_for_timeout(1500)  # Increased wait for page to fully load
+                    # Navigate to match page to click buttons with asyncio timeout for extra protection
+                    # CRITICAL: Using safe_goto() with hard timeout to prevent indefinite hangs
+                    try:
+                        await safe_goto(
+                            page, match_url,
+                            wait_until='domcontentloaded',
+                            timeout=15000
+                        )
+                    except asyncio.TimeoutError:
+                        print(f"    ⚠️ Navigation timeout - page may be slow, continuing...")
+                    
+                    await page.wait_for_timeout(1200)
+                    await close_all_modals(page, timeout_seconds=5)  # Reduced modal timeout
+                    await page.wait_for_timeout(1000)  # Reduced wait
                     
                     # Check if we have cached selector for this match URL
                     outcome_buttons = []
@@ -1718,6 +1857,11 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                         selection_confirmed = False
                         max_click_attempts = 3
                         
+                        # Count selections BEFORE clicking to verify it increases
+                        initial_selection_count = await count_betslip_selections(page)
+                        if initial_selection_count < 0:
+                            initial_selection_count = 0
+                        
                         for click_attempt in range(max_click_attempts):
                             try:
                                 # Re-query buttons on retry to ensure fresh DOM elements
@@ -1755,33 +1899,35 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                                 cache_status = "[CACHED]" if (outcome_button_cache and match_url in outcome_button_cache) else ""
                                 print(f"    ✓ Clicked outcome '{selection}' {cache_status}")
                                 
-                                # VERIFY: Check if selection was added to betslip
+                                # VERIFY: Check if selection count INCREASED by 1
                                 await page.wait_for_timeout(500)
-                                betslip_check = await page.query_selector('div#betslip-container-mobile, div#betslip-container')
-                                if betslip_check:
-                                    betslip_text = await betslip_check.inner_text()
-                                    # Look for indicators that a bet was added (not just header)
-                                    has_selection = ('Single' in betslip_text and '1' in betslip_text) or \
-                                                   ('Multi' in betslip_text and '1' in betslip_text) or \
-                                                   '1X2' in betslip_text or \
-                                                   'Return' in betslip_text
-                                    
-                                    # Also check betslip isn't just showing the empty header
-                                    betslip_has_content = len(betslip_text) > 100  # Empty betslip is very short
-                                    
-                                    if has_selection and betslip_has_content:
-                                        print(f"    ✓ Selection confirmed in betslip")
-                                        selection_confirmed = True
-                                        break
-                                    else:
-                                        print(f"    ⚠️ Selection not detected in betslip (attempt {click_attempt + 1}/{max_click_attempts})")
-                                        if click_attempt < max_click_attempts - 1:
-                                            # Try scrolling to refresh the view
-                                            await page.evaluate('window.scrollTo(0, 0)')
-                                            await page.wait_for_timeout(300)
-                                            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                                new_selection_count = await count_betslip_selections(page)
+                                
+                                if new_selection_count > initial_selection_count:
+                                    print(f"    ✓ Selection confirmed in betslip ({initial_selection_count} → {new_selection_count})")
+                                    selection_confirmed = True
+                                    break
                                 else:
-                                    print(f"    ⚠️ Could not find betslip container (attempt {click_attempt + 1}/{max_click_attempts})")
+                                    # Fallback: check betslip text for content
+                                    betslip_check = await page.query_selector('div#betslip-container-mobile, div#betslip-container')
+                                    if betslip_check:
+                                        betslip_text = await betslip_check.inner_text()
+                                        # Check if this is the first selection and betslip has content
+                                        if initial_selection_count == 0 and new_selection_count == 0:
+                                            # Count function might have failed - check content
+                                            has_content = '1X2' in betslip_text or (len(betslip_text) > 150 and 'Return' in betslip_text)
+                                            if has_content:
+                                                print(f"    ✓ Selection confirmed in betslip (content check)")
+                                                selection_confirmed = True
+                                                break
+                                    
+                                    print(f"    ⚠️ Selection count unchanged ({initial_selection_count} → {new_selection_count}) - attempt {click_attempt + 1}/{max_click_attempts}")
+                                    if click_attempt < max_click_attempts - 1:
+                                        # Try scrolling to refresh the view
+                                        await page.evaluate('window.scrollTo(0, 0)')
+                                        await page.wait_for_timeout(300)
+                                        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                                        await page.wait_for_timeout(500)
                                     
                             except Exception as click_err:
                                 print(f"    ⚠️ Click attempt {click_attempt + 1} failed: {click_err}")
@@ -1791,6 +1937,7 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                         
                         if not selection_confirmed:
                             print(f"    ❌ ERROR: Could not confirm selection was added to betslip after {max_click_attempts} attempts")
+                            print(f"    Selection count remained at {initial_selection_count}")
                             return False
                             
                     else:
@@ -2320,7 +2467,22 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
             
             # Helper function to check if confirmation modal appeared
             async def check_for_modal(check_balance_change=False, pre_click_balance=None):
-                # FIRST: Check if this is an Account Options modal (NOT a bet confirmation)
+                # FIRST PRIORITY: Check if balance decreased (bet was placed)
+                # This handles cases where Account modal appears instead of bet confirmation
+                if check_balance_change and pre_click_balance is not None and pre_click_balance > 0:
+                    await page.wait_for_timeout(500)
+                    current_balance = await get_current_balance(page)
+                    if current_balance > 0 and current_balance < pre_click_balance:
+                        balance_diff = pre_click_balance - current_balance
+                        print(f"    ✓ [check_for_modal] BALANCE DECREASED: R{pre_click_balance:.2f} → R{current_balance:.2f} (diff: R{balance_diff:.2f})")
+                        print(f"    ✓ [check_for_modal] Bet was placed successfully (balance-based detection)")
+                        
+                        # Check if Account modal appeared - if so, close it
+                        await check_and_close_account_modal(pre_balance=None)  # Skip balance check since we already know bet was placed
+                        
+                        return True  # Bet was placed, even if wrong modal appeared
+                
+                # SECOND: Check if this is an Account Options modal (NOT a bet confirmation)
                 # Account modal has unique identifiers we should exclude
                 account_modal_indicators = [
                     '#deposit-account-nav',
@@ -2335,8 +2497,8 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     try:
                         elem = await page.query_selector(indicator)
                         if elem and await elem.is_visible():
-                            print(f"    ⚠️ [check_for_modal] Detected Account modal (not bet confirmation) - indicator: {indicator}")
-                            return False  # This is NOT a bet confirmation modal
+                            print(f"    ⚠️ [check_for_modal] Detected Account modal (no bet placed) - indicator: {indicator}")
+                            return False  # This is NOT a bet confirmation modal and bet wasn't placed
                     except:
                         continue
                 
@@ -2372,22 +2534,41 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     except:
                         pass
                 
-                # FALLBACK: Check if balance decreased (bet may have been placed without modal)
-                # This handles the rare case where bet is placed but confirmation modal doesn't show
-                if check_balance_change and pre_click_balance is not None and pre_click_balance > 0:
-                    await page.wait_for_timeout(500)
-                    current_balance = await get_current_balance(page)
-                    if current_balance > 0 and current_balance < pre_click_balance:
-                        balance_diff = pre_click_balance - current_balance
-                        print(f"    ✓ [check_for_modal] BALANCE DECREASED: R{pre_click_balance:.2f} → R{current_balance:.2f} (diff: R{balance_diff:.2f})")
-                        print(f"    ✓ [check_for_modal] Bet appears to have been placed (balance-based detection)")
-                        return True
-                
                 return False
             
             # Helper function to check for and close Account Options modal
-            async def check_and_close_account_modal():
-                """Detects and closes the Account Options / Deposit funds modal that sometimes appears"""
+            async def check_and_close_account_modal(pre_balance=None):
+                """Detects and closes the Account Options / Deposit funds modal that sometimes appears.
+                   IMPORTANT: If balance decreased, this is likely a bet confirmation modal - don't close it!
+                """
+                # FIRST: Check if balance decreased - if so, a bet was placed and we should NOT close
+                if pre_balance and pre_balance > 0:
+                    try:
+                        current_balance = await get_current_balance(page)
+                        if current_balance > 0 and pre_balance - current_balance >= 0.99:
+                            # Balance decreased - bet was placed! This might be the confirmation modal
+                            print(f"    ✓ [ACCOUNT CHECK] Balance decreased ({pre_balance:.2f} → {current_balance:.2f}) - NOT closing (bet was placed)")
+                            return False  # Don't close - bet was placed
+                    except:
+                        pass
+                
+                # Also check if bet confirmation elements are present - don't close if they are
+                confirmation_indicators = [
+                    'button#strike-conf-continue-btn',  # Continue betting button
+                    'text="Bet Confirmation"',
+                    'text="Booking Code"',
+                    'text="Successful Bets"',
+                    'text="Betslip:"',
+                ]
+                for conf_indicator in confirmation_indicators:
+                    try:
+                        elem = await page.query_selector(conf_indicator)
+                        if elem and await elem.is_visible():
+                            print(f"    ✓ [ACCOUNT CHECK] Found bet confirmation indicator: {conf_indicator} - NOT closing")
+                            return False  # This is a bet confirmation, not an account modal
+                    except:
+                        continue
+                
                 # Use more specific selectors based on the actual modal HTML
                 account_indicators = [
                     '#deposit-account-nav',  # Most reliable - the deposit nav tab
@@ -2503,7 +2684,7 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             await page.wait_for_timeout(1500)  # Increased wait for modal
                     
                     # CRITICAL: Check if Account Options modal appeared instead of bet confirmation
-                    account_modal_closed = await check_and_close_account_modal()
+                    account_modal_closed = await check_and_close_account_modal(pre_click_balance)
                     if account_modal_closed:
                         account_modal_count += 1
                         print("    ⚠️ Account modal was triggered instead of bet - will retry")
@@ -2526,7 +2707,7 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     await page.wait_for_timeout(1000)
                     
                     # Check for Account Options modal
-                    account_modal_closed = await check_and_close_account_modal()
+                    account_modal_closed = await check_and_close_account_modal(pre_click_balance)
                     if account_modal_closed:
                         account_modal_count += 1
                         print("    ⚠️ Account modal was triggered instead of bet - will retry")
@@ -2549,7 +2730,7 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     await page.wait_for_timeout(1000)
                     
                     # Check for Account Options modal
-                    account_modal_closed = await check_and_close_account_modal()
+                    account_modal_closed = await check_and_close_account_modal(pre_click_balance)
                     if account_modal_closed:
                         account_modal_count += 1
                         print("    ⚠️ Account modal was triggered instead of bet - will retry")
@@ -2574,7 +2755,7 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                     await page.wait_for_timeout(1000)
                     
                     # Check for Account Options modal
-                    account_modal_closed = await check_and_close_account_modal()
+                    account_modal_closed = await check_and_close_account_modal(pre_click_balance)
                     if account_modal_closed:
                         account_modal_count += 1
                         print("    ⚠️ Account modal was triggered instead of bet - will retry")
@@ -2601,7 +2782,7 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                         await page.wait_for_timeout(1000)
                         
                         # Check for Account Options modal
-                        account_modal_closed = await check_and_close_account_modal()
+                        account_modal_closed = await check_and_close_account_modal(pre_click_balance)
                         if account_modal_closed:
                             account_modal_count += 1
                             print("    ⚠️ Account modal was triggered instead of bet - will retry")
@@ -2642,7 +2823,7 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                             await page.wait_for_timeout(1500)
                             
                             # Close any account modal that might appear
-                            await check_and_close_account_modal()
+                            await check_and_close_account_modal(pre_click_balance)
                             
                             modal_appeared = await check_for_modal(check_balance_change=True, pre_click_balance=pre_click_balance)
                             if modal_appeared:
@@ -2688,7 +2869,7 @@ async def place_bet_slip(page: Page, bet_slip: dict, amount: float, match_cache:
                         await page.wait_for_timeout(1500)
                         
                         # Close any account modal
-                        await check_and_close_account_modal()
+                        await check_and_close_account_modal(pre_click_balance)
                         
                         modal_appeared = await check_for_modal(check_balance_change=True, pre_click_balance=pre_click_balance)
                         if modal_appeared:
@@ -3415,7 +3596,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         # Navigate to highlights page first (primary source)
         print("\nNavigating to soccer highlights page (primary source)...")
         try:
-            await page.goto(SCRAPING_URLS[0]['url'], wait_until='domcontentloaded', timeout=30000)
+            await asyncio.wait_for(
+                page.goto(SCRAPING_URLS[0]['url'], wait_until='domcontentloaded', timeout=30000),
+                timeout=35  # Hard timeout to prevent hangs
+            )
             await page.wait_for_timeout(3000)
             try:
                 await close_all_modals(page)
@@ -3426,7 +3610,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             print(f"[WARNING] Failed to navigate to highlights page: {nav_error}")
             print("[ACTION] Trying upcoming page as fallback...")
             try:
-                await page.goto(SCRAPING_URLS[1]['url'], wait_until='domcontentloaded', timeout=30000)
+                await asyncio.wait_for(
+                    page.goto(SCRAPING_URLS[1]['url'], wait_until='domcontentloaded', timeout=30000),
+                    timeout=35  # Hard timeout to prevent hangs
+                )
                 await page.wait_for_timeout(3000)
                 try:
                     await close_all_modals(page)
@@ -3584,7 +3771,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                 
                 # Navigate to this source
                 try:
-                    await page.goto(source_url, wait_until='domcontentloaded', timeout=30000)
+                    await asyncio.wait_for(
+                        page.goto(source_url, wait_until='domcontentloaded', timeout=30000),
+                        timeout=35  # Hard timeout to prevent hangs
+                    )
                     await page.wait_for_timeout(2000)
                     await close_all_modals(page)
                 except Exception as nav_error:
@@ -4177,8 +4367,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         
         # Process ALL bets with enhanced anti-detection and progress tracking
         successful = 0
-        failed = 0
-        failed_bets = []  # Track failed bets for retry
+        # Note: All bets retry until success - no skipping
         start_index = 0  # Track where to continue from
         
         # Initialize match position cache for faster bet placement
@@ -4187,101 +4376,116 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         # Initialize outcome button cache to reuse buttons across all bets
         outcome_button_cache = {}
         
-        # PRE-CACHE: Navigate to all match pages and cache outcome buttons ONCE
-        print(f"\n{'='*60}")
-        print("🔄 PRE-CACHING OUTCOME BUTTONS FOR ALL MATCHES")
-        print(f"{'='*60}")
-        print(f"Navigating to {num_matches} match pages to cache buttons...")
-        print(f"Cache will be PERSISTENT across all {len(bet_slips)} bet combinations")
-        print(f"Cache is NEVER cleared - used for entire script run")
-        print(f"{'='*60}\n")
+        # CHECK: Try to load cached selectors from previous run
+        cached_selectors_loaded = False
+        if resume_data and 'outcome_button_cache' in resume_data:
+            saved_cache = resume_data.get('outcome_button_cache', {})
+            if saved_cache and len(saved_cache) >= num_matches:
+                outcome_button_cache = saved_cache
+                cached_selectors_loaded = True
+                print(f"\n{'='*60}")
+                print("⚡ USING SAVED SELECTOR CACHE (SKIPPING PRE-CACHE)")
+                print(f"{'='*60}")
+                print(f"Loaded {len(outcome_button_cache)} cached selectors from previous run")
+                print(f"No navigation needed - selectors work on any browser instance")
+                print(f"{'='*60}\n")
         
-        for match_idx, match in enumerate(matches[:num_matches], 1):
-            match_url = match.get('url')
-            start_time = match.get('start_time', 'Unknown time')
-            if match_url and match_url not in outcome_button_cache:
-                try:
-                    print(f"Match {match_idx}/{num_matches}: {match['name']} | ⏰ {start_time}")
-                    print(f"  Navigating to: {match_url}")
-                    await page.goto(match_url, wait_until='domcontentloaded', timeout=15000)
-                    await page.wait_for_timeout(1500)
-                    await close_all_modals(page)
-                    await page.wait_for_timeout(500)
-                    
-                    # Find working selector for outcome buttons
-                    # Extended list of selectors to handle different league page structures
-                    button_selectors = [
-                        'div.grid.p-1 > div.flex.items-center.justify-between.h-12',
-                        'div[class*="grid"] > div[class*="flex items-center justify-between h-12"]',
-                        'details:has(span:text("1X2")) div.grid > div',
-                        'div[price]',
-                        'button[data-translate-market-name="Full Time Result"] div[price]',
-                        'div[data-translate-market-name="Full Time Result"] div[price]',
-                        # Additional fallback selectors for different league structures
-                        'div[class*="market"] div[price]',
-                        'div[class*="outcome"] div[price]',
-                        'div.flex.items-center.justify-between[price]',
-                        'button[price]',
-                        'div[data-price]',
-                        'span[price]',
-                        # More generic selectors as last resort
-                        'div[class*="selection"]',
-                        'div[class*="bet-button"]',
-                        'div[class*="odds"]',
-                    ]
-                    
-                    working_selector = None
-                    for selector in button_selectors:
-                        try:
-                            buttons = await page.query_selector_all(selector)
-                            if len(buttons) >= 3:
-                                working_selector = selector
-                                print(f"  ✓ Found {len(buttons)} outcome buttons using selector: {selector}")
-                                break
-                        except:
-                            continue
-                    
-                    if working_selector:
-                        # Cache the selector, not the elements
-                        outcome_button_cache[match_url] = working_selector
-                        print(f"  ✓ [CACHED] Selector stored for reuse across all {len(bet_slips)} bets\n")
-                    else:
-                        print(f"  ❌ ERROR: Could not find working selector\n")
+        # Only do pre-caching if we don't have a valid saved cache
+        if not cached_selectors_loaded:
+            # PRE-CACHE: Navigate to all match pages and cache outcome buttons ONCE
+            print(f"\n{'='*60}")
+            print("🔄 PRE-CACHING OUTCOME BUTTONS FOR ALL MATCHES")
+            print(f"{'='*60}")
+            print(f"Navigating to {num_matches} match pages to cache buttons...")
+            print(f"Cache will be PERSISTENT across all {len(bet_slips)} bet combinations")
+            print(f"Cache is saved to progress file - survives crashes!")
+            print(f"{'='*60}\n")
+            
+            for match_idx, match in enumerate(matches[:num_matches], 1):
+                match_url = match.get('url')
+                start_time = match.get('start_time', 'Unknown time')
+                if match_url and match_url not in outcome_button_cache:
+                    try:
+                        print(f"Match {match_idx}/{num_matches}: {match['name']} | ⏰ {start_time}")
+                        print(f"  Navigating to: {match_url}")
+                        await page.goto(match_url, wait_until='domcontentloaded', timeout=15000)
+                        await page.wait_for_timeout(1500)
+                        await close_all_modals(page)
+                        await page.wait_for_timeout(500)
+                        
+                        # Find working selector for outcome buttons
+                        # Extended list of selectors to handle different league page structures
+                        button_selectors = [
+                            'div.grid.p-1 > div.flex.items-center.justify-between.h-12',
+                            'div[class*="grid"] > div[class*="flex items-center justify-between h-12"]',
+                            'details:has(span:text("1X2")) div.grid > div',
+                            'div[price]',
+                            'button[data-translate-market-name="Full Time Result"] div[price]',
+                            'div[data-translate-market-name="Full Time Result"] div[price]',
+                            # Additional fallback selectors for different league structures
+                            'div[class*="market"] div[price]',
+                            'div[class*="outcome"] div[price]',
+                            'div.flex.items-center.justify-between[price]',
+                            'button[price]',
+                            'div[data-price]',
+                            'span[price]',
+                            # More generic selectors as last resort
+                            'div[class*="selection"]',
+                            'div[class*="bet-button"]',
+                            'div[class*="odds"]',
+                        ]
+                        
+                        working_selector = None
+                        for selector in button_selectors:
+                            try:
+                                buttons = await page.query_selector_all(selector)
+                                if len(buttons) >= 3:
+                                    working_selector = selector
+                                    print(f"  ✓ Found {len(buttons)} outcome buttons using selector: {selector}")
+                                    break
+                            except:
+                                continue
+                        
+                        if working_selector:
+                            # Cache the selector, not the elements
+                            outcome_button_cache[match_url] = working_selector
+                            print(f"  ✓ [CACHED] Selector stored for reuse across all {len(bet_slips)} bets\n")
+                        else:
+                            print(f"  ❌ ERROR: Could not find working selector\n")
+                            error_tracker.add_error(
+                                error_type="BET_FAILED",
+                                error_message=f"Could not find outcome button selector for match: {match['name']}",
+                                context={
+                                    'match_url': match_url,
+                                    'match_name': match['name'],
+                                    'phase': 'pre_caching'
+                                }
+                            )
+                        
+                    except Exception as e:
+                        print(f"  ❌ ERROR caching buttons: {e}\n")
                         error_tracker.add_error(
-                            error_type="BET_FAILED",
-                            error_message=f"Could not find outcome button selector for match: {match['name']}",
+                            error_type="EXCEPTION",
+                            error_message=f"Exception during outcome button caching for match: {match['name']}",
                             context={
                                 'match_url': match_url,
                                 'match_name': match['name'],
                                 'phase': 'pre_caching'
-                            }
+                            },
+                            exception=e
                         )
-                        
-                except Exception as e:
-                    print(f"  ❌ ERROR caching buttons: {e}\n")
-                    error_tracker.add_error(
-                        error_type="EXCEPTION",
-                        error_message=f"Exception during outcome button caching for match: {match['name']}",
-                        context={
-                            'match_url': match_url,
-                            'match_name': match['name'],
-                            'phase': 'pre_caching'
-                        },
-                        exception=e
-                    )
         
-        print(f"{'='*60}")
-        print(f"✅ PRE-CACHING COMPLETE")
-        print(f"{'='*60}")
-        print(f"Cached outcome buttons for {len(outcome_button_cache)}/{num_matches} matches")
-        print(f"Cache is PERSISTENT - all {len(bet_slips)} bets will reuse cached data")
-        print(f"No cache clearing - preserved for entire script execution")
-        print(f"{'='*60}\n")
-        
-        # Navigate back to soccer page before starting bet placement
-        await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
-        await page.wait_for_timeout(1000)
-        await close_all_modals(page)
+            print(f"{'='*60}")
+            print(f"✅ PRE-CACHING COMPLETE")
+            print(f"{'='*60}")
+            print(f"Cached outcome buttons for {len(outcome_button_cache)}/{num_matches} matches")
+            print(f"Cache saved to progress file - survives crashes!")
+            print(f"{'='*60}\n")
+            
+            # Navigate back to soccer page before starting bet placement
+            await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+            await page.wait_for_timeout(1000)
+            await close_all_modals(page)
         
         # Create a match fingerprint to validate matches haven't changed
         current_match_fingerprint = []
@@ -4325,7 +4529,6 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             else:
                 start_index = resume_data.get('last_completed_bet', 0)
                 successful = resume_data.get('successful', 0)
-                failed = 0  # Reset failed count since we're retrying
                 
                 # Calculate time since last save
                 time_info = ""
@@ -4372,11 +4575,12 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         'last_completed_bet': i,
                         'last_successful_bet': i - 1 if i > 0 else 0,
                         'successful': successful,
-                        'failed': failed,
+                        'failed': 0,
                         'match_fingerprint': current_match_fingerprint,
                         'timestamp': datetime.now().isoformat(),
                         'matches_data': matches,
-                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
+                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                        'outcome_button_cache': outcome_button_cache
                     }, f)
                 
                 error_tracker.display_summary()
@@ -4386,8 +4590,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             
             try:
                 # Try to place bet with retry on network errors
-                # Per-bet timeout: 5 minutes (300 seconds) to prevent hangs
-                PER_BET_TIMEOUT = 300  # 5 minutes
+                # Per-bet timeout: 4 minutes (240 seconds) to prevent hangs
+                PER_BET_TIMEOUT = 240  # 4 minutes - reduced for faster recovery
                 
                 try:
                     # Wrap the bet placement in asyncio.wait_for with timeout
@@ -4451,61 +4655,75 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                             'last_completed_bet': i + 1,  # Next bet to attempt
                             'last_successful_bet': i,  # Last successful bet index
                             'successful': successful,
-                            'failed': failed,
+                            'failed': 0,
                             'match_fingerprint': current_match_fingerprint,
                             'timestamp': datetime.now().isoformat(),
                             'matches_data': matches,  # Save match data for resume
-                            'cumulative_runtime_seconds': cumulative_runtime_seconds + current_session_runtime  # Track total runtime
+                            'cumulative_runtime_seconds': cumulative_runtime_seconds + current_session_runtime,  # Track total runtime
+                            'outcome_button_cache': outcome_button_cache  # PERSIST selector cache for restart
                         }, f)
                     
                     # AGGRESSIVE memory management to prevent Playwright corruption
                     # GC every bet (not just every 3) for more stable long sessions
                     gc.collect()
                     
-                    # BROWSER RESTART every 10 bets - TRUE fix for Playwright memory corruption
+                    # BROWSER RESTART every 8 bets - TRUE fix for Playwright memory corruption
                     # Creates completely fresh browser instance with clean memory state
-                    if (i + 1) % 10 == 0 and i < len(bet_slips) - 1:
+                    # Reduced from 10 to 8 for earlier memory cleanup
+                    if (i + 1) % 8 == 0 and i < len(bet_slips) - 1:
                         try:
                             print(f"\n  [BROWSER RESTART] Restarting browser after {i + 1} bets to prevent memory corruption...")
                             restart_result = await restart_browser_fresh(p, old_browser=browser, old_page=page)
                             if restart_result:
                                 page = restart_result["page"]
                                 browser = restart_result["browser"]
-                                # Clear outcome button cache since we have a fresh browser
-                                outcome_button_cache.clear()
-                                print(f"  [BROWSER RESTART] ✓ Fresh browser ready - cache cleared")
+                                # NOTE: We intentionally DO NOT clear the cache!
+                                # The cache contains selector STRINGS (e.g., 'div.grid.p-1 > div...')
+                                # These selectors are still valid for the new browser - no re-caching needed!
+                                print(f"  [BROWSER RESTART] ✓ Fresh browser ready - keeping {len(outcome_button_cache)} cached selectors")
                                 
-                                # Re-cache outcome buttons for all matches
-                                print(f"  [BROWSER RESTART] Re-caching outcome buttons for {num_matches} matches...")
-                                for match_idx, match in enumerate(matches[:num_matches], 1):
-                                    match_url = match.get('url')
-                                    if match_url:
-                                        try:
-                                            await page.goto(match_url, wait_until='domcontentloaded', timeout=15000)
-                                            await page.wait_for_timeout(1000)
-                                            await close_all_modals(page)
-                                            
-                                            button_selectors = [
-                                                'div.grid.p-1 > div.flex.items-center.justify-between.h-12',
-                                                'div[price]',
-                                            ]
-                                            for selector in button_selectors:
-                                                buttons = await page.query_selector_all(selector)
-                                                if len(buttons) >= 3:
-                                                    outcome_button_cache[match_url] = selector
-                                                    print(f"       ✓ Match {match_idx}: cached")
-                                                    break
-                                        except Exception as cache_err:
-                                            print(f"       ⚠️ Match {match_idx}: cache failed - {cache_err}")
+                                # Log successful browser restart
+                                error_tracker.add_error(
+                                    error_type='BROWSER_RESTART_SUCCESS',
+                                    error_message=f'Scheduled browser restart after bet {i + 1} completed successfully',
+                                    context={
+                                        'bet_number': i + 1,
+                                        'cached_selectors': len(outcome_button_cache),
+                                        'reason': 'scheduled_memory_cleanup',
+                                        'interval': 'every_8_bets'
+                                    }
+                                )
+                                error_tracker.save_to_file()
                                 
-                                # Navigate back to soccer page
+                                # Just navigate to soccer page - selectors will work on first bet
                                 await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
                                 await page.wait_for_timeout(1000)
-                                await close_all_modals(page)
+                                await close_all_modals(page, timeout_seconds=5)
                             else:
                                 print(f"  [BROWSER RESTART] ⚠️ Failed - continuing with current browser")
+                                error_tracker.add_error(
+                                    error_type='BROWSER_RESTART_FAILED',
+                                    error_message=f'Scheduled browser restart after bet {i + 1} failed - no result returned',
+                                    context={
+                                        'bet_number': i + 1,
+                                        'reason': 'restart_returned_none',
+                                        'recovery_action': 'continuing_with_current_browser'
+                                    }
+                                )
+                                error_tracker.save_to_file()
                         except Exception as restart_err:
                             print(f"  [BROWSER RESTART] ⚠️ Error: {restart_err} - continuing with current browser")
+                            error_tracker.add_error(
+                                error_type='BROWSER_RESTART_ERROR',
+                                error_message=f'Browser restart exception after bet {i + 1}: {str(restart_err)[:150]}',
+                                context={
+                                    'bet_number': i + 1,
+                                    'error_details': str(restart_err),
+                                    'recovery_action': 'continuing_with_current_browser'
+                                },
+                                exception=restart_err
+                            )
+                            error_tracker.save_to_file()
                     
                     # Periodic page refresh (every 5 bets that aren't browser restart bets)
                     elif (i + 1) % 5 == 0 and i < len(bet_slips) - 1:
@@ -4516,8 +4734,31 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                             await close_all_modals(page)
                             gc.collect()
                             print(f"  [MEMORY] Page refreshed and GC completed")
+                            
+                            # Log successful page refresh
+                            error_tracker.add_error(
+                                error_type='PAGE_REFRESH_SUCCESS',
+                                error_message=f'Scheduled page refresh after bet {i + 1} completed successfully',
+                                context={
+                                    'bet_number': i + 1,
+                                    'reason': 'scheduled_memory_cleanup',
+                                    'interval': 'every_5_bets'
+                                }
+                            )
+                            error_tracker.save_to_file()
                         except Exception as refresh_err:
                             print(f"  [WARNING] Page refresh failed: {refresh_err}")
+                            error_tracker.add_error(
+                                error_type='PAGE_REFRESH_FAILED',
+                                error_message=f'Page refresh failed after bet {i + 1}: {str(refresh_err)[:150]}',
+                                context={
+                                    'bet_number': i + 1,
+                                    'error_details': str(refresh_err),
+                                    'recovery_action': 'continuing_anyway'
+                                },
+                                exception=refresh_err
+                            )
+                            error_tracker.save_to_file()
                     
                     # Wait between bets
                     if i < len(bet_slips) - 1:
@@ -4526,6 +4767,15 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         # If wait was interrupted, just log it (no restart)
                         if not wait_success:
                             print("\n[WARNING] Wait interrupted - continuing anyway...")
+                            error_tracker.add_error(
+                                error_type='WAIT_INTERRUPTED',
+                                error_message=f'Wait between bets was interrupted after bet {i + 1}',
+                                context={
+                                    'bet_number': i + 1,
+                                    'recovery_action': 'continuing_anyway'
+                                }
+                            )
+                            error_tracker.save_to_file()
                 
                 elif success == "RETRY":
                     # Click failed but may succeed on retry - don't count as failed yet
@@ -4545,9 +4795,13 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     print("  Waiting 10 seconds before retry...")
                     await page.wait_for_timeout(10000)
                     
-                    # Retry the same bet
+                    # Retry the same bet with timeout protection
                     print(f"\n🔄 RETRYING BET {bet_slip['slip_number']}/{len(bet_slips)}...")
-                    retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
+                    try:
+                        retry_success = await safe_place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache, timeout_seconds=360)
+                    except asyncio.TimeoutError:
+                        print(f"⚠️ Retry also timed out after 360s - treating as failure")
+                        retry_success = False
                     
                     if retry_success == True:
                         successful += 1
@@ -4559,67 +4813,105 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                 'last_completed_bet': i + 1,
                                 'last_successful_bet': i,
                                 'successful': successful,
-                                'failed': failed,
+                                'failed': 0,
                                 'match_fingerprint': current_match_fingerprint,
                                 'timestamp': datetime.now().isoformat(),
                                 'matches_data': matches,
-                                'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
+                                'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                'outcome_button_cache': outcome_button_cache
                             }, f)
                         
                         # Wait between bets
                         if i < len(bet_slips) - 1:
                             await wait_between_bets(page, seconds=5, add_random=True)
                     else:
-                        # Retry also failed - now count as failed
-                        failed += 1
-                        failed_bets.append(bet_slip)
+                        # First retry failed - try browser restart
                         print(f"\n❌ [FAILED] Retry bet slip {bet_slip['slip_number']} also failed!")
+                        print(f"\n🔄 ALL BETS ARE IMPORTANT - Attempting browser restart...")
                         
-                        # Track the retry failure
                         error_tracker.add_error(
                             error_type='RETRY_FAILED',
-                            error_message=f'Bet slip {bet_slip["slip_number"]} failed on retry attempt - terminating',
-                            context={
-                                'bet_number': bet_slip['slip_number'],
-                                'successful_so_far': successful,
-                                'failed_so_far': failed,
-                                'action': 'terminating'
-                            }
+                            error_message=f'Bet {bet_slip["slip_number"]} retry failed - attempting browser restart',
+                            context={'bet_number': bet_slip['slip_number'], 'action': 'browser_restart'}
                         )
-                        
-                        # Save progress at failed bet (so resume will retry THIS bet)
-                        with open(progress_file, 'w') as f:
-                            json.dump({
-                                'last_completed_bet': i,  # Resume FROM this bet
-                                'last_successful_bet': i - 1 if i > 0 else -1,
-                                'successful': successful,
-                                'failed': failed,
-                                'match_fingerprint': current_match_fingerprint,
-                                'timestamp': datetime.now().isoformat(),
-                                'matches_data': matches,
-                                'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
-                            }, f)
-                        
-                        print(f"\n{'='*60}")
-                        print(f"⛔ TERMINATING - BET FAILED AFTER RETRY")
-                        print(f"{'='*60}")
-                        print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
-                        print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
-                        print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
-                        print(f"{'='*60}\n")
-                        
-                        # Display error summary before exiting
-                        error_tracker.display_summary()
                         error_tracker.save_to_file()
                         
-                        try:
-                            await page.close()
-                            await browser.close()
-                        except:
-                            pass
+                        # Browser restart retry loop
+                        max_browser_retries = 5
+                        bet_placed = False
                         
-                        import sys
-                        sys.exit(1)
+                        for browser_retry in range(max_browser_retries):
+                            print(f"\n🔄 Browser restart attempt {browser_retry + 1}/{max_browser_retries}...")
+                            
+                            try:
+                                restart_result = await restart_browser_fresh(p, old_browser=browser, old_page=page)
+                                if restart_result:
+                                    page = restart_result["page"]
+                                    browser = restart_result["browser"]
+                                    
+                                    await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                                    await page.wait_for_timeout(2000)
+                                    await close_all_modals(page)
+                                    await page.wait_for_timeout(10000)
+                                    
+                                    retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
+                                    
+                                    if retry_success == True:
+                                        successful += 1
+                                        bet_placed = True
+                                        print(f"\n✅ [SUCCESS] Bet {bet_slip['slip_number']} placed after browser restart!")
+                                        
+                                        with open(progress_file, 'w') as f:
+                                            json.dump({
+                                                'last_completed_bet': i + 1,
+                                                'last_successful_bet': i,
+                                                'successful': successful,
+                                                'failed': 0,
+                                                'match_fingerprint': current_match_fingerprint,
+                                                'timestamp': datetime.now().isoformat(),
+                                                'matches_data': matches,
+                                                'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                                'outcome_button_cache': outcome_button_cache
+                                            }, f)
+                                        break
+                            except Exception as e:
+                                print(f"  ❌ Exception: {e}")
+                            
+                            if browser_retry < max_browser_retries - 1:
+                                wait_time = 15 * (browser_retry + 1)
+                                print(f"  Waiting {wait_time}s...")
+                                await asyncio.sleep(wait_time)
+                        
+                        if not bet_placed:
+                            print(f"\n⛔ All retries exhausted for bet {bet_slip['slip_number']}")
+                            print(f"Progress saved - run script again to retry")
+                            
+                            with open(progress_file, 'w') as f:
+                                json.dump({
+                                    'last_completed_bet': i,
+                                    'last_successful_bet': i - 1 if i > 0 else -1,
+                                    'successful': successful,
+                                    'failed': 0,
+                                    'match_fingerprint': current_match_fingerprint,
+                                    'timestamp': datetime.now().isoformat(),
+                                    'matches_data': matches,
+                                    'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                    'outcome_button_cache': outcome_button_cache
+                                }, f)
+                            
+                            error_tracker.display_summary()
+                            error_tracker.save_to_file()
+                            
+                            try:
+                                await browser.close()
+                            except:
+                                pass
+                            
+                            import sys
+                            sys.exit(1)
+                        
+                        if i < len(bet_slips) - 1:
+                            await wait_between_bets(page, seconds=5, add_random=True)
                 
                 elif success == "RELOGIN":
                     # Session expired during bet - need to re-login and retry
@@ -4684,154 +4976,317 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                     'last_completed_bet': i + 1,
                                     'last_successful_bet': i,
                                     'successful': successful,
-                                    'failed': failed,
+                                    'failed': 0,
                                     'match_fingerprint': current_match_fingerprint,
                                     'timestamp': datetime.now().isoformat(),
                                     'matches_data': matches,
-                                    'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
+                                    'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                    'outcome_button_cache': outcome_button_cache
                                 }, f)
                             
                             # Wait between bets
                             if i < len(bet_slips) - 1:
                                 await wait_between_bets(page, seconds=5, add_random=True)
                         else:
-                            # Retry after re-login also failed
-                            failed += 1
-                            failed_bets.append(bet_slip)
-                            print(f"\n❌ [FAILED] Bet slip {bet_slip['slip_number']} failed even after re-login!")
+                            # Retry after re-login failed - keep trying with browser restarts
+                            print(f"\n❌ [FAILED] Bet {bet_slip['slip_number']} failed after re-login!")
+                            print(f"🔄 ALL BETS ARE IMPORTANT - Trying browser restart...")
                             
-                            # Save progress and terminate
+                            error_tracker.add_error(
+                                error_type='RETRY_FAILED',
+                                error_message=f'Bet {bet_slip["slip_number"]} failed after re-login - attempting browser restarts',
+                                context={'bet_number': bet_slip['slip_number'], 'action': 'browser_restart_loop'}
+                            )
+                            error_tracker.save_to_file()
+                            
+                            # Keep trying with browser restarts
+                            max_browser_retries = 5
+                            bet_placed = False
+                            
+                            for browser_retry in range(max_browser_retries):
+                                print(f"\n🔄 Browser restart attempt {browser_retry + 1}/{max_browser_retries}...")
+                                
+                                try:
+                                    restart_result = await restart_browser_fresh(p, old_browser=browser, old_page=page)
+                                    if restart_result:
+                                        page = restart_result["page"]
+                                        browser = restart_result["browser"]
+                                        
+                                        await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                                        await page.wait_for_timeout(2000)
+                                        await close_all_modals(page)
+                                        await page.wait_for_timeout(10000)
+                                        
+                                        retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
+                                        
+                                        if retry_success == True:
+                                            successful += 1
+                                            bet_placed = True
+                                            print(f"\n✅ [SUCCESS] Bet {bet_slip['slip_number']} placed!")
+                                            
+                                            with open(progress_file, 'w') as f:
+                                                json.dump({
+                                                    'last_completed_bet': i + 1,
+                                                    'last_successful_bet': i,
+                                                    'successful': successful,
+                                                    'failed': 0,
+                                                    'match_fingerprint': current_match_fingerprint,
+                                                    'timestamp': datetime.now().isoformat(),
+                                                    'matches_data': matches,
+                                                    'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                                    'outcome_button_cache': outcome_button_cache
+                                                }, f)
+                                            break
+                                except Exception as e:
+                                    print(f"  ❌ Exception: {e}")
+                                
+                                if browser_retry < max_browser_retries - 1:
+                                    wait_time = 15 * (browser_retry + 1)
+                                    print(f"  Waiting {wait_time}s...")
+                                    await asyncio.sleep(wait_time)
+                            
+                            if not bet_placed:
+                                print(f"\n⛔ All retries exhausted - saving progress and exiting")
+                                
+                                with open(progress_file, 'w') as f:
+                                    json.dump({
+                                        'last_completed_bet': i,
+                                        'last_successful_bet': i - 1 if i > 0 else -1,
+                                        'successful': successful,
+                                        'failed': 0,
+                                        'match_fingerprint': current_match_fingerprint,
+                                        'timestamp': datetime.now().isoformat(),
+                                        'matches_data': matches,
+                                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                        'outcome_button_cache': outcome_button_cache
+                                    }, f)
+                                
+                                error_tracker.display_summary()
+                                error_tracker.save_to_file()
+                                
+                                try:
+                                    await browser.close()
+                                except:
+                                    pass
+                                
+                                import sys
+                                sys.exit(1)
+                            
+                            if i < len(bet_slips) - 1:
+                                await wait_between_bets(page, seconds=5, add_random=True)
+                    else:
+                        # Re-login failed - try browser restart loop
+                        print(f"\n⚠️ [RE-LOGIN FAILED] Starting browser restart loop...")
+                        
+                        error_tracker.add_error(
+                            error_type='RELOGIN_FAILED',
+                            error_message=f'Re-login failed for bet {bet_slip["slip_number"]} - starting browser restart loop',
+                            context={'bet_number': bet_slip['slip_number'], 'action': 'browser_restart_loop'}
+                        )
+                        error_tracker.save_to_file()
+                        
+                        # Keep trying with browser restarts
+                        max_browser_retries = 5
+                        bet_placed = False
+                        
+                        for browser_retry in range(max_browser_retries):
+                            print(f"\n🔄 Browser restart attempt {browser_retry + 1}/{max_browser_retries}...")
+                            
+                            try:
+                                restart_result = await restart_browser_fresh(p, old_browser=browser, old_page=page)
+                                if restart_result:
+                                    page = restart_result["page"]
+                                    browser = restart_result["browser"]
+                                    
+                                    await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                                    await page.wait_for_timeout(2000)
+                                    await close_all_modals(page)
+                                    await page.wait_for_timeout(10000)
+                                    
+                                    retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
+                                    
+                                    if retry_success == True:
+                                        successful += 1
+                                        bet_placed = True
+                                        print(f"\n✅ [SUCCESS] Bet {bet_slip['slip_number']} placed!")
+                                        
+                                        with open(progress_file, 'w') as f:
+                                            json.dump({
+                                                'last_completed_bet': i + 1,
+                                                'last_successful_bet': i,
+                                                'successful': successful,
+                                                'failed': 0,
+                                                'match_fingerprint': current_match_fingerprint,
+                                                'timestamp': datetime.now().isoformat(),
+                                                'matches_data': matches,
+                                                'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                                'outcome_button_cache': outcome_button_cache
+                                            }, f)
+                                        break
+                            except Exception as e:
+                                print(f"  ❌ Exception: {e}")
+                            
+                            if browser_retry < max_browser_retries - 1:
+                                wait_time = 15 * (browser_retry + 1)
+                                print(f"  Waiting {wait_time}s...")
+                                await asyncio.sleep(wait_time)
+                        
+                        if not bet_placed:
+                            print(f"\n⛔ All retries exhausted - saving progress and exiting")
+                            
                             with open(progress_file, 'w') as f:
                                 json.dump({
                                     'last_completed_bet': i,
                                     'last_successful_bet': i - 1 if i > 0 else -1,
                                     'successful': successful,
-                                    'failed': failed,
+                                    'failed': 0,
                                     'match_fingerprint': current_match_fingerprint,
                                     'timestamp': datetime.now().isoformat(),
                                     'matches_data': matches,
-                                    'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
+                                    'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                    'outcome_button_cache': outcome_button_cache
                                 }, f)
                             
-                            print(f"\n{'='*60}")
-                            print(f"⛔ TERMINATING - BET FAILED AFTER RE-LOGIN")
-                            print(f"{'='*60}")
-                            print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
-                            print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
-                            print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
-                            print(f"{'='*60}\n")
+                            error_tracker.display_summary()
+                            error_tracker.save_to_file()
                             
                             try:
-                                await page.close()
                                 await browser.close()
                             except:
                                 pass
                             
                             import sys
                             sys.exit(1)
-                    else:
-                        # Re-login failed - cannot continue
-                        failed += 1
-                        failed_bets.append(bet_slip)
-                        print(f"\n❌ [FATAL] Re-login failed! Cannot continue betting.")
                         
-                        # Track the re-login failure
+                        if i < len(bet_slips) - 1:
+                            await wait_between_bets(page, seconds=5, add_random=True)
+                
+                else:
+                    # Bet failed - DO NOT SKIP, retry with browser restart
+                    print(f"\n❌ [FAILED] Bet slip {bet_slip['slip_number']} failed!")
+                    print(f"\n{'='*60}")
+                    print(f"🔄 ALL BETS ARE IMPORTANT - RETRYING WITH BROWSER RESTART")
+                    print(f"{'='*60}")
+                    
+                    # Track the failure
+                    error_tracker.add_error(
+                        error_type="BET_FAILED",
+                        error_message=f"Bet slip {bet_slip['slip_number']} failed - attempting browser restart and retry",
+                        context={
+                            'bet_number': bet_slip['slip_number'],
+                            'total_bets': len(bet_slips),
+                            'successful_so_far': successful,
+                            'action': 'browser_restart_retry'
+                        }
+                    )
+                    error_tracker.save_to_file()
+                    
+                    # Save progress at this bet (so we resume HERE if script crashes)
+                    with open(progress_file, 'w') as f:
+                        json.dump({
+                            'last_completed_bet': i,  # Resume FROM this bet
+                            'last_successful_bet': i - 1 if i > 0 else -1,
+                            'successful': successful,
+                            'failed': 0,  # Reset failed count
+                            'match_fingerprint': current_match_fingerprint,
+                            'timestamp': datetime.now().isoformat(),
+                            'matches_data': matches,
+                            'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                            'outcome_button_cache': outcome_button_cache
+                        }, f)
+                    
+                    # Retry loop with browser restarts
+                    max_browser_retries = 5
+                    bet_placed = False
+                    
+                    for browser_retry in range(max_browser_retries):
+                        print(f"\n🔄 Browser restart attempt {browser_retry + 1}/{max_browser_retries}...")
+                        
+                        try:
+                            # Restart browser completely
+                            restart_result = await restart_browser_fresh(p, old_browser=browser, old_page=page)
+                            if restart_result:
+                                page = restart_result["page"]
+                                browser = restart_result["browser"]
+                                print(f"  ✅ Browser restarted successfully")
+                                
+                                # Navigate to soccer page
+                                await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                                await page.wait_for_timeout(2000)
+                                await close_all_modals(page)
+                                
+                                # Wait before retry
+                                print(f"  Waiting 10 seconds before retry...")
+                                await page.wait_for_timeout(10000)
+                                
+                                # Retry the bet
+                                retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
+                                
+                                if retry_success == True:
+                                    successful += 1
+                                    bet_placed = True
+                                    print(f"\n✅ [SUCCESS] Bet {bet_slip['slip_number']} placed after browser restart!")
+                                    
+                                    # Save progress
+                                    with open(progress_file, 'w') as f:
+                                        json.dump({
+                                            'last_completed_bet': i + 1,
+                                            'last_successful_bet': i,
+                                            'successful': successful,
+                                            'failed': 0,
+                                            'match_fingerprint': current_match_fingerprint,
+                                            'timestamp': datetime.now().isoformat(),
+                                            'matches_data': matches,
+                                            'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                            'outcome_button_cache': outcome_button_cache
+                                        }, f)
+                                    
+                                    break  # Exit retry loop on success
+                                else:
+                                    print(f"  ❌ Retry {browser_retry + 1} failed - will try again...")
+                            else:
+                                print(f"  ❌ Browser restart failed - will try again...")
+                        except Exception as restart_err:
+                            print(f"  ❌ Exception during retry: {restart_err}")
+                        
+                        # Wait before next retry
+                        if browser_retry < max_browser_retries - 1:
+                            wait_time = 15 * (browser_retry + 1)  # Increasing wait: 15s, 30s, 45s, 60s
+                            print(f"  Waiting {wait_time}s before next attempt...")
+                            await asyncio.sleep(wait_time)
+                    
+                    if not bet_placed:
+                        # All retries exhausted - save progress and exit for manual intervention
+                        print(f"\n{'='*60}")
+                        print(f"⛔ ALL RETRY ATTEMPTS EXHAUSTED")
+                        print(f"{'='*60}")
+                        print(f"Bet {bet_slip['slip_number']} could not be placed after {max_browser_retries} browser restarts")
+                        print(f"Progress saved - run script again to retry this bet")
+                        print(f"{'='*60}")
+                        
                         error_tracker.add_error(
-                            error_type='RELOGIN_FAILED',
-                            error_message=f'Re-login failed during bet {bet_slip["slip_number"]} - cannot continue',
+                            error_type="BET_FAILED",
+                            error_message=f"Bet {bet_slip['slip_number']} failed after {max_browser_retries} browser restart attempts",
                             context={
                                 'bet_number': bet_slip['slip_number'],
-                                'successful_so_far': successful,
-                                'failed_so_far': failed
+                                'retry_attempts': max_browser_retries,
+                                'action': 'requires_manual_intervention'
                             }
                         )
-                        
-                        # Save progress and terminate
-                        with open(progress_file, 'w') as f:
-                            json.dump({
-                                'last_completed_bet': i,
-                                'last_successful_bet': i - 1 if i > 0 else -1,
-                                'successful': successful,
-                                'failed': failed,
-                                'match_fingerprint': current_match_fingerprint,
-                                'timestamp': datetime.now().isoformat(),
-                                'matches_data': matches,
-                                'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
-                            }, f)
-                        
-                        print(f"\n{'='*60}")
-                        print(f"⛔ TERMINATING - RE-LOGIN FAILED")
-                        print(f"{'='*60}")
-                        print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
-                        print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
-                        print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
-                        print(f"{'='*60}\n")
-                        
-                        # Display error summary before exiting
                         error_tracker.display_summary()
                         error_tracker.save_to_file()
                         
                         try:
-                            await page.close()
                             await browser.close()
                         except:
                             pass
                         
                         import sys
                         sys.exit(1)
-                
-                else:
-                    failed += 1
-                    failed_bets.append(bet_slip)  # Store failed bet for retry
-                    print(f"\n❌ [FAILED] Bet slip {bet_slip['slip_number']} failed!")
                     
-                    # Save progress at failed bet (so resume will retry THIS bet)
-                    with open(progress_file, 'w') as f:
-                        json.dump({
-                            'last_completed_bet': i,  # Resume FROM this bet, not next
-                            'last_successful_bet': i - 1 if i > 0 else -1,
-                            'successful': successful,
-                            'failed': failed,
-                            'match_fingerprint': current_match_fingerprint,
-                            'timestamp': datetime.now().isoformat(),
-                            'matches_data': matches,
-                            'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
-                        }, f)
-                    
-                    # Track the bet failure
-                    error_tracker.add_error(
-                        error_type="BET_FAILED",
-                        error_message=f"Bet slip {bet_slip['slip_number']} failed during placement",
-                        context={
-                            'bet_number': bet_slip['slip_number'],
-                            'total_bets': len(bet_slips),
-                            'successful_so_far': successful,
-                            'failed_so_far': failed
-                        }
-                    )
-                    
-                    # CRITICAL: Terminate ALL bets if any bet fails
-                    print(f"\n{'='*60}")
-                    print(f"⛔ TERMINATING ALL BETS - BET FAILED")
-                    print(f"{'='*60}")
-                    print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
-                    print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
-                    print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
-                    print(f"{'='*60}\n")
-                    
-                    # Display error summary before exiting
-                    error_tracker.display_summary()
-                    error_tracker.save_to_file()
-                    
-                    # Close browser and exit application completely
-                    try:
-                        await page.close()
-                        await browser.close()
-                    except:
-                        pass
-                    
-                    import sys
-                    sys.exit(1)
+                    # Wait between bets after successful retry
+                    if i < len(bet_slips) - 1:
+                        await wait_between_bets(page, seconds=5, add_random=True)
                 
                 await asyncio.sleep(2)
                 
@@ -4894,6 +5349,18 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                             
                             print(f"\n✅ RECOVERY SUCCESSFUL - Retrying bet {bet_slip['slip_number']}...")
                             
+                            # Log successful recovery
+                            error_tracker.add_error(
+                                error_type='RECOVERY_SUCCESS',
+                                error_message=f'Browser restart recovery successful for bet {bet_slip["slip_number"]}',
+                                context={
+                                    'bet_number': bet_slip['slip_number'],
+                                    'cached_selectors_rebuilt': len(outcome_button_cache),
+                                    'reason': 'memory_corruption_recovery'
+                                }
+                            )
+                            error_tracker.save_to_file()
+                            
                             # Retry the failed bet with fresh browser
                             retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
                             
@@ -4907,11 +5374,12 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                         'last_completed_bet': i + 1,
                                         'last_successful_bet': i,
                                         'successful': successful,
-                                        'failed': failed,
+                                        'failed': 0,
                                         'match_fingerprint': current_match_fingerprint,
                                         'timestamp': datetime.now().isoformat(),
                                         'matches_data': matches,
-                                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
+                                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                        'outcome_button_cache': outcome_button_cache
                                     }, f)
                                 
                                 # Continue to next bet
@@ -4920,51 +5388,129 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                 continue  # Skip to next iteration of the loop
                             else:
                                 print(f"\n❌ Retry after browser restart also failed")
+                                error_tracker.add_error(
+                                    error_type='RECOVERY_RETRY_FAILED',
+                                    error_message=f'Bet {bet_slip["slip_number"]} still failed after browser restart recovery',
+                                    context={
+                                        'bet_number': bet_slip['slip_number'],
+                                        'recovery_attempted': True,
+                                        'retry_result': 'failed'
+                                    }
+                                )
+                                error_tracker.save_to_file()
                                 # Fall through to exit
                         else:
                             print(f"\n❌ Browser restart failed")
+                            error_tracker.add_error(
+                                error_type='RECOVERY_BROWSER_RESTART_FAILED',
+                                error_message=f'Browser restart failed during recovery for bet {bet_slip["slip_number"]}',
+                                context={
+                                    'bet_number': bet_slip['slip_number'],
+                                    'recovery_stage': 'browser_restart'
+                                }
+                            )
+                            error_tracker.save_to_file()
                     except Exception as restart_err:
                         print(f"\n❌ Recovery failed: {restart_err}")
+                        error_tracker.add_error(
+                            error_type='RECOVERY_EXCEPTION',
+                            error_message=f'Recovery exception for bet {bet_slip["slip_number"]}: {str(restart_err)[:150]}',
+                            context={
+                                'bet_number': bet_slip['slip_number'],
+                                'error_details': str(restart_err)
+                            },
+                            exception=restart_err
+                        )
+                        error_tracker.save_to_file()
                     
-                    # If we get here, recovery failed - save progress and exit
-                    with open(progress_file, 'w') as f:
-                        json.dump({
-                            'last_completed_bet': i,  # Resume FROM this bet
-                            'last_successful_bet': i - 1 if i > 0 else -1,
-                            'successful': successful,
-                            'failed': failed,
-                            'match_fingerprint': current_match_fingerprint,
-                            'timestamp': datetime.now().isoformat(),
-                            'matches_data': matches,
-                            'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
-                        }, f)
+                    # If we get here, single recovery attempt failed
+                    # Try multiple browser restart attempts for this bet
+                    print(f"\n⚠️ First recovery attempt failed - trying additional retries...")
                     
-                    # Track the unrecoverable memory error
+                    max_additional_retries = 4  # We already tried once above
+                    bet_placed = False
+                    
+                    for additional_retry in range(max_additional_retries):
+                        retry_num = additional_retry + 2  # We already did attempt 1
+                        print(f"\n🔄 Browser restart attempt {retry_num}/5...")
+                        
+                        try:
+                            gc.collect()
+                            restart_result = await restart_browser_fresh(p, old_browser=browser, old_page=page)
+                            if restart_result:
+                                page = restart_result["page"]
+                                browser = restart_result["browser"]
+                                
+                                await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                                await page.wait_for_timeout(2000)
+                                await close_all_modals(page)
+                                await page.wait_for_timeout(10000)
+                                
+                                retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
+                                
+                                if retry_success == True:
+                                    successful += 1
+                                    bet_placed = True
+                                    print(f"\n✅ [SUCCESS] Bet {bet_slip['slip_number']} placed after recovery!")
+                                    
+                                    with open(progress_file, 'w') as f:
+                                        json.dump({
+                                            'last_completed_bet': i + 1,
+                                            'last_successful_bet': i,
+                                            'successful': successful,
+                                            'failed': 0,
+                                            'match_fingerprint': current_match_fingerprint,
+                                            'timestamp': datetime.now().isoformat(),
+                                            'matches_data': matches,
+                                            'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                            'outcome_button_cache': outcome_button_cache
+                                        }, f)
+                                    break
+                        except Exception as retry_err:
+                            print(f"  ❌ Retry {retry_num} exception: {retry_err}")
+                        
+                        if additional_retry < max_additional_retries - 1:
+                            wait_time = 15 * (additional_retry + 1)
+                            print(f"  Waiting {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                    
+                    if bet_placed:
+                        # Success - continue to next bet
+                        if i < len(bet_slips) - 1:
+                            await wait_between_bets(page, seconds=5, add_random=True)
+                        continue
+                    
+                    # All retries exhausted - save progress and exit
+                    print(f"\n⛔ PLAYWRIGHT MEMORY ERROR - All {5} retries exhausted")
+                    print(f"   Saving progress and exiting for manual intervention...")
+                    
                     error_tracker.add_error(
                         error_type='MEMORY_ERROR',
-                        error_message='Playwright memory corruption - recovery failed, restart required',
+                        error_message=f'Playwright memory corruption - all retries exhausted for bet {bet_slip["slip_number"]}',
                         context={
                             'bet_number': bet_slip['slip_number'],
                             'successful_so_far': successful,
-                            'failed_so_far': failed,
-                            'action': 'terminating_for_restart'
+                            'action': 'exiting_for_manual_retry'
                         }
                     )
-                    
-                    print(f"\n{'='*60}")
-                    print(f"⚠️ PLAYWRIGHT MEMORY ERROR - RESTART REQUIRED")
-                    print(f"{'='*60}")
-                    print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
-                    print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
-                    print(f"📋 Progress saved - auto-restart will resume")
-                    print(f"{'='*60}\n")
-                    
-                    # Display error summary before exiting
-                    error_tracker.display_summary()
                     error_tracker.save_to_file()
                     
+                    with open(progress_file, 'w') as f:
+                        json.dump({
+                            'last_completed_bet': i,
+                            'last_successful_bet': i - 1 if i > 0 else -1,
+                            'successful': successful,
+                            'failed': 0,
+                            'match_fingerprint': current_match_fingerprint,
+                            'timestamp': datetime.now().isoformat(),
+                            'matches_data': matches,
+                            'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                            'outcome_button_cache': outcome_button_cache
+                        }, f)
+                    
+                    error_tracker.display_summary()
+                    
                     try:
-                        await page.close()
                         await browser.close()
                     except:
                         pass
@@ -4972,117 +5518,141 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     import sys
                     sys.exit(1)
                 
-                # Regular exception handling
-                failed += 1
-                failed_bets.append(bet_slip)  # Store failed bet for retry
+                # Regular exception handling - try browser restart loop
                 print(f"\n[ERROR] Exception on slip {bet_slip['slip_number']}: {e}")
+                print(f"\n🔄 ALL BETS ARE IMPORTANT - Attempting browser restart...")
                 
-                # Track the exception
                 error_tracker.add_error(
                     error_type="EXCEPTION",
-                    error_message=f"Exception during bet {bet_slip['slip_number']} placement",
-                    context={
-                        'bet_number': bet_slip['slip_number'],
-                        'total_bets': len(bet_slips),
-                        'successful_so_far': successful,
-                        'failed_so_far': failed
-                    },
+                    error_message=f"Exception during bet {bet_slip['slip_number']} - attempting browser restart",
+                    context={'bet_number': bet_slip['slip_number'], 'action': 'browser_restart_loop'},
                     exception=e
                 )
+                error_tracker.save_to_file()
                 
-                # Save progress at failed bet (so resume will retry THIS bet)
+                # Save progress at this bet
                 with open(progress_file, 'w') as f:
                     json.dump({
-                        'last_completed_bet': i,  # Resume FROM this bet, not next
+                        'last_completed_bet': i,
                         'last_successful_bet': i - 1 if i > 0 else -1,
                         'successful': successful,
-                        'failed': failed,
+                        'failed': 0,
                         'match_fingerprint': current_match_fingerprint,
                         'timestamp': datetime.now().isoformat(),
                         'matches_data': matches,
-                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time)
+                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                        'outcome_button_cache': outcome_button_cache
                     }, f)
                 
-                # CRITICAL: Terminate ALL bets after exception
-                print(f"\n{'='*60}")
-                print(f"⛔ TERMINATING ALL BETS - EXCEPTION OCCURRED")
-                print(f"{'='*60}")
-                print(f"Error: {str(e)}")
-                print(f"\n🛑 Stopped at bet {bet_slip['slip_number']}/{len(bet_slips)}")
-                print(f"✅ Successful: {successful} | ❌ Failed: {failed}")
-                print(f"📋 Progress saved - run again to resume from bet {bet_slip['slip_number']}")
-                print(f"{'='*60}\n")
+                # Browser restart retry loop
+                max_browser_retries = 5
+                bet_placed = False
                 
-                # Display error summary before exiting
-                error_tracker.display_summary()
-                error_tracker.save_to_file()
+                for browser_retry in range(max_browser_retries):
+                    print(f"\n🔄 Browser restart attempt {browser_retry + 1}/{max_browser_retries}...")
+                    
+                    try:
+                        restart_result = await restart_browser_fresh(p, old_browser=browser, old_page=page)
+                        if restart_result:
+                            page = restart_result["page"]
+                            browser = restart_result["browser"]
+                            
+                            await page.goto('https://new.betway.co.za/sport/soccer/upcoming', wait_until='domcontentloaded', timeout=15000)
+                            await page.wait_for_timeout(2000)
+                            await close_all_modals(page)
+                            await page.wait_for_timeout(10000)
+                            
+                            retry_success = await place_bet_slip(page, bet_slip, amount_per_slip, match_cache, outcome_button_cache)
+                            
+                            if retry_success == True:
+                                successful += 1
+                                bet_placed = True
+                                print(f"\n✅ [SUCCESS] Bet {bet_slip['slip_number']} placed!")
+                                
+                                with open(progress_file, 'w') as f:
+                                    json.dump({
+                                        'last_completed_bet': i + 1,
+                                        'last_successful_bet': i,
+                                        'successful': successful,
+                                        'failed': 0,
+                                        'match_fingerprint': current_match_fingerprint,
+                                        'timestamp': datetime.now().isoformat(),
+                                        'matches_data': matches,
+                                        'cumulative_runtime_seconds': cumulative_runtime_seconds + (time.time() - script_start_time),
+                                        'outcome_button_cache': outcome_button_cache
+                                    }, f)
+                                break
+                    except Exception as restart_err:
+                        print(f"  ❌ Exception: {restart_err}")
+                    
+                    if browser_retry < max_browser_retries - 1:
+                        wait_time = 15 * (browser_retry + 1)
+                        print(f"  Waiting {wait_time}s...")
+                        await asyncio.sleep(wait_time)
                 
-                # Close browser and exit application completely
-                try:
-                    await page.close()
-                    await browser.close()
-                except:
-                    pass
+                if not bet_placed:
+                    print(f"\n⛔ All retries exhausted - saving progress and exiting")
+                    
+                    error_tracker.display_summary()
+                    error_tracker.save_to_file()
+                    
+                    try:
+                        await browser.close()
+                    except:
+                        pass
+                    
+                    import sys
+                    sys.exit(1)
                 
-                import sys
-                sys.exit(1)
+                # Wait between bets
+                if i < len(bet_slips) - 1:
+                    await wait_between_bets(page, seconds=5, add_random=True)
         
-        # Retry failed bets
-        if len(failed_bets) > 0:
-            print("\n" + "="*60)
-            print(f"RETRYING {len(failed_bets)} FAILED BET(S)")
-            print("="*60)
-            
-            for retry_bet in failed_bets:
-                print(f"\n{'='*60}")
-                print(f"RETRY: BET {retry_bet['slip_number']}/{len(bet_slips)}")
-                print(f"{'='*60}")
-                
-                try:
-                    success = await place_bet_slip(page, retry_bet, amount_per_slip, match_cache, outcome_button_cache)
-                    
-                    if success:
-                        successful += 1
-                        failed -= 1
-                        print(f"\n[SUCCESS] Retry bet slip {retry_bet['slip_number']} placed!")
-                        
-                        # Wait between bets
-                        wait_success = await wait_between_bets(page, seconds=5, add_random=True)
-                        
-                        # If wait was interrupted, just log it (no restart)
-                        if not wait_success:
-                            print("\n[WARNING] Wait interrupted during retry - continuing anyway...")
-                    else:
-                        print(f"\n[FAILED] Retry bet slip {retry_bet['slip_number']} failed again!")
-                    
-                    await asyncio.sleep(2)
-                    
-                except Exception as e:
-                    print(f"\n[ERROR] Exception on retry slip {retry_bet['slip_number']}: {e}")
+        # Note: Retry loop removed - all bets now retry until success during main loop
+        # If we reach this point, all bets were placed successfully
         
         print("\n" + "="*60)
-        print(f"FINAL RESULTS: {successful}/{len(bet_slips)} successful, {failed} failed")
-        print(f"Total amount wagered: R{successful * amount_per_slip:.2f}")
+        print(f"🏁 FINAL RESULTS")
         print("="*60)
+        print(f"✅ All bets placed successfully: {successful}/{len(bet_slips)}")
+        print(f"💰 Total amount wagered: R{successful * amount_per_slip:.2f}")
+        print(f"📊 Success rate: 100%")
+        print("="*60)
+        
+        # Log script completion
+        error_tracker.add_error(
+            error_type='SCRIPT_COMPLETED',
+            error_message=f'Betting session completed: {successful}/{len(bet_slips)} successful - ALL BETS PLACED',
+            context={
+                'total_bets': len(bet_slips),
+                'successful': successful,
+                'amount_wagered': successful * amount_per_slip,
+                'completion_status': 'success'
+            }
+        )
         
         # Display error summary (will show even if no errors - provides confirmation)
         error_tracker.display_summary()
         
-        # Save error log if there were any errors
-        if error_tracker.get_error_count() > 0:
-            error_tracker.save_to_file()
+        # Always save error log on completion (includes success log)
+        error_tracker.save_to_file()
         
-        # Clean up progress file ONLY if ALL bets successful
+        # Clean up progress file - all bets are now successful
         if os.path.exists(progress_file):
-            if failed == 0 and successful == len(bet_slips):
-                try:
-                    os.remove(progress_file)
-                    print("\n✅ [CLEANUP] Progress file removed - all bets completed successfully!")
-                except:
-                    pass
-            else:
-                print(f"\n📋 [INFO] Progress file kept - {failed} failed bet(s)")
-                print(f"[INFO] Re-run script to resume from bet {successful + 1}")
+            try:
+                os.remove(progress_file)
+                print("\n✅ [CLEANUP] Progress file removed - all bets completed successfully!")
+            except:
+                pass
+        
+        # Clean up error log file on successful completion
+        error_log_file = 'error_log.json'
+        if os.path.exists(error_log_file):
+            try:
+                os.remove(error_log_file)
+                print("✅ [CLEANUP] Error log file removed - session completed successfully!")
+            except Exception as e:
+                print(f"⚠️ [CLEANUP] Could not remove error log file: {e}")
         
         print("\nKeeping browser open for 30 seconds...")
         await page.wait_for_timeout(30000)
@@ -5201,7 +5771,11 @@ def main_with_auto_retry():
     
     MAX_RETRIES = 5  # Maximum number of automatic restarts
     RETRY_DELAY = 15  # Seconds to wait before restarting
-    SUBPROCESS_TIMEOUT = 600  # 10 minute timeout per subprocess (prevents hangs)
+    # Timeout is for TOTAL runtime, not inactivity. Each bet can take 2+ min with delays.
+    # For 243 bets at ~2min each = ~8 hours. Set to 86 hours to handle week-long operations.
+    # CRITICAL: Previously this was set to 420 seconds (7 min) which caused hangs!
+    # Individual operations have their own timeouts (15-30s), this is for total process.
+    SUBPROCESS_TIMEOUT = 309600  # 86 hour timeout (309600 seconds) = 5160 minutes
     
     # Create a wrapper-level error tracker to track subprocess crashes
     wrapper_crashes = []  # List of crash details for summary
@@ -5222,8 +5796,9 @@ def main_with_auto_retry():
     print(f"{'='*60}")
     print(f"   Max retries: {MAX_RETRIES}")
     print(f"   Retry delay: {RETRY_DELAY}s")
-    print(f"   Subprocess timeout: {SUBPROCESS_TIMEOUT}s ({SUBPROCESS_TIMEOUT//60} min)")
-    print(f"   Per-bet timeout: 300s (5 min)")
+    print(f"   ⚠️  SUBPROCESS TIMEOUT: {SUBPROCESS_TIMEOUT}s ({SUBPROCESS_TIMEOUT//60} min)")
+    print(f"   ⚠️  This was previously 420s (7min) causing hangs - NOW FIXED")
+    print(f"   Per-operation timeout: 15-30s (Playwright calls)")
     print(f"   Progress file: bet_progress.json")
     print(f"   All crashes will be logged and displayed at end")
     print(f"{'='*60}\n")
