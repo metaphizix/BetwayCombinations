@@ -4158,6 +4158,32 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                 print(f"  - {src}: {count} match(es)")
             print(f"{'='*60}\n")
             
+            # SORT all filtered matches by start time (ascending) for optimal selection
+            if filtered_matches:
+                print(f"\n{'='*60}")
+                print("🔄 SORTING MATCHES BY START TIME (ASCENDING)")
+                print(f"{'='*60}")
+                
+                # Sort matches by their parsed time value
+                def get_sort_key(match):
+                    """Get sortable time key for a match"""
+                    time_minutes = parse_match_time(match)
+                    if time_minutes is None:
+                        return 999999  # Put unparseable times at the end
+                    return time_minutes
+                
+                filtered_matches.sort(key=get_sort_key)
+                
+                print(f"✓ Sorted {len(filtered_matches)} matches by start time")
+                print("  First 5 matches after sorting:")
+                for i, m in enumerate(filtered_matches[:5], 1):
+                    start_time = m.get('start_time', 'Unknown')
+                    source = m.get('source', 'Unknown')
+                    print(f"    {i}. {m['name']} - {start_time} [from {source}]")
+                if len(filtered_matches) > 5:
+                    print(f"    ... and {len(filtered_matches) - 5} more")
+                print(f"{'='*60}\n")
+            
             if len(filtered_matches) < num_matches:
                 print(f"\n[ERROR] Could not find {num_matches} matches with {min_gap_hours}+ hour gaps")
                 print(f"Searched both Highlights and Upcoming pages")
