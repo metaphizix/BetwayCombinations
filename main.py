@@ -3579,12 +3579,47 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         print(f"  Anti-Detection: 5s waits + random delays + browser restarts")
         print("="*60)
         
-        # Define the scraping URLs - highlights first, then upcoming as fallback
+        # Define the scraping URLs - specific leagues first, then highlights, then upcoming as fallback
         SCRAPING_URLS = [
+            {
+                'url': 'https://new.betway.co.za/sport/soccer/highlights?register=1&selectedLeagues=england_premier-league',
+                'name': 'Premier League',
+                'description': 'England Premier League matches'
+            },
+            {
+                'url': 'https://new.betway.co.za/sport/soccer/highlights?register=1&selectedLeagues=international-clubs_uefa-champions-league',
+                'name': 'Champions League',
+                'description': 'UEFA Champions League matches'
+            },
+            {
+                'url': 'https://new.betway.co.za/sport/soccer/highlights?register=1&selectedLeagues=south-africa_premiership',
+                'name': 'SA Premiership',
+                'description': 'South Africa Premiership matches'
+            },
+            {
+                'url': 'https://new.betway.co.za/sport/soccer/highlights?register=1&selectedLeagues=germany_bundesliga',
+                'name': 'Bundesliga',
+                'description': 'Germany Bundesliga matches'
+            },
+            {
+                'url': 'https://new.betway.co.za/sport/soccer/highlights?register=1&selectedLeagues=spain_la-liga',
+                'name': 'La Liga',
+                'description': 'Spain La Liga matches'
+            },
+            {
+                'url': 'https://new.betway.co.za/sport/soccer/highlights?register=1&selectedLeagues=france_ligue-1',
+                'name': 'Ligue 1',
+                'description': 'France Ligue 1 matches'
+            },
+            {
+                'url': 'https://new.betway.co.za/sport/soccer/highlights?register=1&selectedLeagues=italy_serie-a',
+                'name': 'Serie A',
+                'description': 'Italy Serie A matches'
+            },
             {
                 'url': 'https://new.betway.co.za/sport/soccer/highlights',
                 'name': 'Highlights',
-                'description': 'Featured/popular matches'
+                'description': 'Featured/popular matches (all leagues)'
             },
             {
                 'url': 'https://new.betway.co.za/sport/soccer/upcoming',
@@ -3593,8 +3628,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             }
         ]
         
-        # Navigate to highlights page first (primary source)
-        print("\nNavigating to soccer highlights page (primary source)...")
+        # Navigate to first URL (Premier League) as primary source
+        print("\nNavigating to Premier League page (primary source)...")
         try:
             await asyncio.wait_for(
                 page.goto(SCRAPING_URLS[0]['url'], wait_until='domcontentloaded', timeout=30000),
@@ -3607,8 +3642,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                 pass  # Non-critical if modal closing fails
             print(f"[OK] Loaded {SCRAPING_URLS[0]['name']} page - {SCRAPING_URLS[0]['description']}")
         except Exception as nav_error:
-            print(f"[WARNING] Failed to navigate to highlights page: {nav_error}")
-            print("[ACTION] Trying upcoming page as fallback...")
+            print(f"[WARNING] Failed to navigate to {SCRAPING_URLS[0]['name']} page: {nav_error}")
+            print("[ACTION] Trying next URL in sequence as fallback...")
             try:
                 await asyncio.wait_for(
                     page.goto(SCRAPING_URLS[1]['url'], wait_until='domcontentloaded', timeout=30000),
@@ -3621,13 +3656,13 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     pass
                 print(f"[OK] Loaded {SCRAPING_URLS[1]['name']} page as fallback")
             except Exception as fallback_error:
-                print(f"[ERROR] Failed to navigate to both pages: {fallback_error}")
+                print(f"[ERROR] Failed to navigate to first two URLs: {fallback_error}")
                 error_tracker.add_error(
                     error_type="NETWORK_FAILURE" if 'timeout' in str(fallback_error).lower() else "EXCEPTION",
-                    error_message=f"Failed to navigate to both highlights and upcoming pages: {str(fallback_error)[:150]}",
+                    error_message=f"Failed to navigate to {SCRAPING_URLS[0]['name']} and {SCRAPING_URLS[1]['name']} pages: {str(fallback_error)[:150]}",
                     context={
-                        'highlights_url': SCRAPING_URLS[0]['url'],
-                        'upcoming_url': SCRAPING_URLS[1]['url'],
+                        'first_url': SCRAPING_URLS[0]['url'],
+                        'second_url': SCRAPING_URLS[1]['url'],
                         'phase': 'initial_navigation'
                     },
                     exception=fallback_error
@@ -4115,7 +4150,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                 source_counts[src] = source_counts.get(src, 0) + 1
             
             print(f"\n{'='*60}")
-            print(f"✅ SMART SCRAPING COMPLETE (HIGHLIGHTS → UPCOMING)")
+            print(f"✅ SMART SCRAPING COMPLETE (LEAGUE PRIORITY → HIGHLIGHTS → UPCOMING)")
             print(f"{'='*60}")
             print(f"Found {len(filtered_matches)}/{num_matches} matches meeting all conditions")
             print(f"Match sources breakdown:")
@@ -4161,7 +4196,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             print(f"     📌 Source: {source}")
         print(f"{'='*60}")
         print(f"All matches are {min_gap_hours}+ hours apart from each other")
-        print(f"Matches can be from Highlights and/or Upcoming pages")
+        print(f"Matches can be from any of the configured league sources")
         print(f"{'='*60}\n")
         
         # CRITICAL: Validate all matches have cached URLs before proceeding
