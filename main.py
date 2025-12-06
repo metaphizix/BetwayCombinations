@@ -3573,10 +3573,9 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
         # Formula: min_avg_odd = (2 × 3^n)^(1/n) where n = num_matches
         # This ensures the product of max odds ≥ 2 × total_cost
         total_combinations = 3 ** num_matches
-        # Reduced threshold for more achievable matches: 1.0x multiplier
-        # Examples: 1 match = 3.0, 2 matches = 3.0, 3 matches = 3.0, 4 matches = 3.0
-        required_odds_product = 1.0 * total_combinations
-        min_odds_threshold = required_odds_product ** (1 / num_matches)
+        # Balanced threshold: 3.5 for reasonable profit potential
+        # Provides good chance of profit while still being achievable
+        min_odds_threshold = 3.5
         
         print(f"\nParameters:")
         print(f"  Matches per slip: {num_matches}")
