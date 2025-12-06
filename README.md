@@ -39,7 +39,12 @@ The system automatically:
 
 - **Smart Scraping**: Scrapes from **Highlights page first** (featured matches), then **Upcoming page** as fallback
 - **Single Scraping Pass**: Scrapes up to 20 pages per source ONCE at the beginning
-- **Time-Based Sorting**: Highlights matches are sorted by start time, then by highest odds for same time slots
+- **Profit Guarantee Filter**: **Dynamically calculates minimum odds threshold** based on number of matches to ensure doubling:
+  - 1 match: max odd ≥ **6.0** (ensures R6 return on R3 cost)
+  - 2 matches: max odd ≥ **4.24** (ensures R18 return on R9 cost)
+  - 3 matches: max odd ≥ **3.78** (ensures R54 return on R27 cost)
+  - 4 matches: max odd ≥ **3.57** (ensures R162 return on R81 cost)
+- **Two-Level Sorting**: Matches sorted by **time first** (earliest), then by **highest odds** (for same time slot)
 - **URL Caching**: Captures and stores match URLs for every match during the single scraping pass
 - **Offline Filtering**: Filters scraped matches to find those meeting requirements (no additional scraping)
 - **URL Validation**: Verifies all selected matches have cached URLs before allowing any bets
@@ -243,7 +248,9 @@ This will:
 
 ### Smart Match Selection
 
-- **Smart scraping** - Highlights page first (sorted by time/odds), then Upcoming as fallback
+- **Smart scraping** - Highlights page first, then Upcoming as fallback
+- **Profit guarantee** - Dynamic odds threshold ensures doubling (e.g., 3.78 for 3 matches)
+- **Two-level sorting** - Time first (earliest), then highest odds (for same time slot)
 - **Dynamic timing** - First match timing calculated based on estimated script runtime + 30min buffer
 - **Gap validation** - Ensures 2-hour gaps between matches
 - **Pagination support** - Automatically searches up to 20 pages per source

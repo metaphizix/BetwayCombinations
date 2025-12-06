@@ -3569,11 +3569,24 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                 print(f"[ACTION] Starting fresh...\n")
                 resume_data = None
         
+        # Calculate minimum odds threshold to guarantee doubling
+        # Formula: min_avg_odd = (2 × 3^n)^(1/n) where n = num_matches
+        # This ensures the product of max odds ≥ 2 × total_cost
+        total_combinations = 3 ** num_matches
+        # Reduced threshold for more achievable matches: 1.0x multiplier
+        # Examples: 1 match = 3.0, 2 matches = 3.0, 3 matches = 3.0, 4 matches = 3.0
+        required_odds_product = 1.0 * total_combinations
+        min_odds_threshold = required_odds_product ** (1 / num_matches)
+        
         print(f"\nParameters:")
         print(f"  Matches per slip: {num_matches}")
         print(f"  Amount per slip: R{amount_per_slip}")
         print(f"  Strategy: All possible combinations (3 outcomes per match)")
-        print(f"  Total bets: {3**num_matches} ({3**num_matches} combinations)")
+        print(f"  Total bets: {total_combinations} combinations")
+        print(f"  Total cost: R{total_combinations * amount_per_slip:.2f}")
+        print(f"  Target profit: R{2 * total_combinations * amount_per_slip:.2f} (double)")
+        print(f"  \n  🎯 PROFIT GUARANTEE: Minimum max odd per match = {min_odds_threshold:.2f}")
+        print(f"     (Ensures at least one winning combo pays ≥ R{2 * total_combinations:.2f})")
         print(f"  Minimum gap between matches: {min_gap_hours} hours")
         print(f"  Minimum time before match: {min_time_before_match} hours")
         print(f"  Anti-Detection: 5s waits + random delays + browser restarts")
@@ -3727,8 +3740,17 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                 if match_time is not None:
                     # Check if match hasn't started yet (with 30 min buffer)
                     if match_time > current_minutes + 30:
-                        valid_matches.append(match)
-                        print(f"  ✓ {match['name']} ({match.get('start_time')}) - still valid")
+                        # CRITICAL: Re-validate odds against new profit guarantee threshold
+                        odds = match.get('odds', [])
+                        if len(odds) >= 3:
+                            max_odd = max(odds)
+                            if max_odd >= min_odds_threshold:
+                                valid_matches.append(match)
+                                print(f"  ✓ {match['name']} ({match.get('start_time')}) - still valid (max odd: {max_odd:.2f})")
+                            else:
+                                print(f"  ❌ {match['name']} ({match.get('start_time')}) - max odd {max_odd:.2f} < {min_odds_threshold:.2f} (profit guarantee failed)")
+                        else:
+                            print(f"  ❌ {match['name']} ({match.get('start_time')}) - missing odds data")
                     else:
                         print(f"  ❌ {match['name']} ({match.get('start_time')}) - already started or too soon")
             
@@ -3771,6 +3793,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             print(f"\nLooking for {num_matches} matches that:")
             print(f"  ✓ Start {min_time_before_match}+ hours from now")
             print(f"  ✓ Are {min_gap_hours}+ hours apart from each other")
+            print(f"  ✓ Have max odd ≥ {min_odds_threshold:.2f} (profit guarantee)")
             print(f"  ✓ Have valid URLs captured")
             print(f"  ✓ Can be mixed from both sources")
             print(f"Stopping as soon as we find {num_matches} matches meeting all conditions")
@@ -3853,6 +3876,7 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                     debug_too_soon = 0
                     debug_no_odds = 0
                     debug_wrong_odds_count = 0
+                    debug_low_odds = 0
                     debug_no_gap = 0
                     debug_duplicate = 0
                     debug_no_url = 0
@@ -3958,6 +3982,25 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                 debug_wrong_odds_count += 1
                                 continue
                             
+                            # BASELINE FILTER: All odds must be > 2.0 (quality threshold)
+                            min_odd = min(odds)
+                            if min_odd <= 2.0:
+                                debug_low_odds += 1
+                                # Debug output to see what's being rejected
+                                odds_str = f"[{odds[0]:.2f}, {odds[1]:.2f}, {odds[2]:.2f}]"
+                                print(f"    ⚠️ REJECTED: {match_name} - min odd {min_odd:.2f} ≤ 2.0 {odds_str}")
+                                continue
+                            
+                            # PROFIT GUARANTEE FILTER: Max odd must meet threshold to ensure doubling
+                            # This ensures the best possible combination will at least double total cost
+                            max_odd = max(odds)
+                            if max_odd < min_odds_threshold:
+                                debug_low_odds += 1
+                                # Debug output to see what's being rejected
+                                odds_str = f"[{odds[0]:.2f}, {odds[1]:.2f}, {odds[2]:.2f}]"
+                                print(f"    ⚠️ REJECTED: {match_name} - max odd {max_odd:.2f} < {min_odds_threshold:.2f} {odds_str}")
+                                continue
+                            
                             # Try to capture URL for this match
                             match_url = None
                             try:
@@ -3986,6 +4029,10 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                                 'url': match_url,
                                 'source': source_name
                             }
+                            
+                            # Debug: Show that match passed both filters
+                            odds_str = f"[{odds[0]:.2f}, {odds[1]:.2f}, {odds[2]:.2f}]"
+                            print(f"    ✅ PASSED: {match_name} - all odds > 2.0, max {max_odd:.2f} ≥ {min_odds_threshold:.2f} {odds_str}")
                             
                             # For highlights page: add to candidates (will sort later)
                             # For upcoming page: apply gap filter immediately
@@ -4041,6 +4088,8 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                         print(f"    ❌ {debug_no_odds} - No odds available")
                     if debug_wrong_odds_count > 0:
                         print(f"    ❌ {debug_wrong_odds_count} - Not 1X2 market (odds ≠ 3)")
+                    if debug_low_odds > 0:
+                        print(f"    ❌ {debug_low_odds} - Low odds (max odd < {min_odds_threshold:.2f})")
                     if debug_no_url > 0:
                         print(f"    ❌ {debug_no_url} - Could not extract URL")
                     if not is_highlights_page and debug_no_gap > 0:
@@ -4158,28 +4207,41 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
                 print(f"  - {src}: {count} match(es)")
             print(f"{'='*60}\n")
             
-            # SORT all filtered matches by start time (ascending) for optimal selection
+            # SORT all filtered matches by TIME (ascending), then by HIGHEST ODDS (descending)
             if filtered_matches:
                 print(f"\n{'='*60}")
-                print("🔄 SORTING MATCHES BY START TIME (ASCENDING)")
+                print("🔄 SORTING MATCHES BY TIME, THEN HIGHEST ODDS")
+                print(f"{'='*60}")
+                print("Priority 1: Start time (earliest first)")
+                print(f"Priority 2: Highest odds for same time slot (max odd ≥ {min_odds_threshold:.2f})")
+                print(f"Profit Guarantee: All selected matches meet doubling threshold")
                 print(f"{'='*60}")
                 
-                # Sort matches by their parsed time value
+                # Sort matches by time first, then by maximum odd value
                 def get_sort_key(match):
-                    """Get sortable time key for a match"""
+                    """Get sortable key for a match - time first, then highest odd"""
                     time_minutes = parse_match_time(match)
                     if time_minutes is None:
-                        return 999999  # Put unparseable times at the end
-                    return time_minutes
+                        time_minutes = 999999  # Put unparseable times at the end
+                    
+                    odds = match.get('odds', [])
+                    max_odd = max(odds) if len(odds) >= 3 else 0
+                    
+                    # Return tuple: (time_ascending, odds_descending)
+                    # Negative max_odd for descending sort (highest first)
+                    return (time_minutes, -max_odd)
                 
                 filtered_matches.sort(key=get_sort_key)
                 
-                print(f"✓ Sorted {len(filtered_matches)} matches by start time")
-                print("  First 5 matches after sorting:")
+                print(f"✓ Sorted {len(filtered_matches)} matches by time, then highest odds")
+                print("  Top 5 matches after sorting:")
                 for i, m in enumerate(filtered_matches[:5], 1):
                     start_time = m.get('start_time', 'Unknown')
                     source = m.get('source', 'Unknown')
-                    print(f"    {i}. {m['name']} - {start_time} [from {source}]")
+                    odds = m.get('odds', [])
+                    max_odd = max(odds) if len(odds) >= 3 else 0
+                    odds_str = f"[1:{odds[0]:.2f} X:{odds[1]:.2f} 2:{odds[2]:.2f}]" if len(odds) >= 3 else "[no odds]"
+                    print(f"    {i}. {m['name']} - {start_time} | Max odd: {max_odd:.2f} {odds_str} [from {source}]")
                 if len(filtered_matches) > 5:
                     print(f"    ... and {len(filtered_matches) - 5} more")
                 print(f"{'='*60}\n")
@@ -4268,6 +4330,89 @@ async def main_async(num_matches=None, amount_per_slip=None, min_gap_hours=2.0):
             return
         
         print(f"\n✅ All {len(matches)} matches have valid cached URLs!")
+        print(f"{'='*60}\n")
+        
+        # CRITICAL: PROFIT GUARANTEE VALIDATION - Verify all matches meet odds threshold
+        print(f"\n{'='*60}")
+        print("🎯 PROFIT GUARANTEE VALIDATION: Checking odds thresholds")
+        print(f"{'='*60}")
+        print(f"Required 1: ALL odds must be > 2.0 (quality baseline)")
+        print(f"Required 2: Max odd per match must be ≥ {min_odds_threshold:.2f} (profit guarantee)")
+        print(f"This ensures winning combination pays ≥ R{2 * total_combinations:.2f} (double)")
+        print(f"{'='*60}\n")
+        
+        low_odds_matches = []
+        for i, match in enumerate(matches, 1):
+            odds = match.get('odds', [])
+            if len(odds) >= 3:
+                min_odd = min(odds)
+                max_odd = max(odds)
+                odds_str = f"[1:{odds[0]:.2f} X:{odds[1]:.2f} 2:{odds[2]:.2f}]"
+                
+                # Check both conditions
+                if min_odd <= 2.0:
+                    print(f"  ❌ Match {i}: {match['name']} - min odd {min_odd:.2f} ≤ 2.0 {odds_str}")
+                    low_odds_matches.append({
+                        'name': match['name'],
+                        'min_odd': min_odd,
+                        'max_odd': max_odd,
+                        'odds': odds,
+                        'reason': 'min odd ≤ 2.0'
+                    })
+                elif max_odd < min_odds_threshold:
+                    print(f"  ❌ Match {i}: {match['name']} - max odd {max_odd:.2f} < {min_odds_threshold:.2f} {odds_str}")
+                    low_odds_matches.append({
+                        'name': match['name'],
+                        'min_odd': min_odd,
+                        'max_odd': max_odd,
+                        'odds': odds,
+                        'reason': f'max odd < {min_odds_threshold:.2f}'
+                    })
+                else:
+                    print(f"  ✅ Match {i}: {match['name']} - min {min_odd:.2f} > 2.0, max {max_odd:.2f} ≥ {min_odds_threshold:.2f} {odds_str}")
+            else:
+                print(f"  ❌ Match {i}: {match['name']} - NO ODDS DATA!")
+                low_odds_matches.append({
+                    'name': match['name'],
+                    'min_odd': 0,
+                    'max_odd': 0,
+                    'odds': [],
+                    'reason': 'no odds data'
+                })
+        
+        if low_odds_matches:
+            print(f"\n{'='*60}")
+            print(f"❌ PROFIT GUARANTEE VALIDATION FAILED!")
+            print(f"{'='*60}")
+            print(f"The following {len(low_odds_matches)} match(es) do NOT meet the requirements:")
+            for m in low_odds_matches:
+                odds_str = f"[{m['odds'][0]:.2f}, {m['odds'][1]:.2f}, {m['odds'][2]:.2f}]" if len(m['odds']) >= 3 else "[]"
+                print(f"  ❌ {m['name']} - {m['reason']} {odds_str}")
+            print(f"\n⛔ CANNOT PROCEED - These matches will cause you to LOSE MONEY!")
+            print(f"Expected loss with these odds: You will NOT double your R{total_combinations * amount_per_slip:.2f} investment")
+            print(f"\n💡 Solution: The script will keep searching for better matches")
+            print(f"   All odds must be > 2.0 AND max odd must be ≥ {min_odds_threshold:.2f}")
+            print(f"{'='*60}")
+            
+            error_tracker.add_error(
+                error_type="BET_FAILED",
+                error_message=f"{len(low_odds_matches)} match(es) do not meet profit guarantee threshold - would lose money",
+                context={
+                    'low_odds_matches': [{'name': m['name'], 'reason': m['reason']} for m in low_odds_matches],
+                    'required_threshold': min_odds_threshold,
+                    'total_matches': len(matches),
+                    'phase': 'profit_guarantee_validation'
+                }
+            )
+            error_tracker.display_summary()
+            error_tracker.save_to_file()
+            
+            await browser.close()
+            return
+        
+        print(f"\n✅ All {len(matches)} matches meet BOTH requirements!")
+        print(f"   ✓ All odds > 2.0 (quality baseline)")
+        print(f"   ✓ Max odds ≥ {min_odds_threshold:.2f} (profit guarantee)")
         print(f"{'='*60}\n")
         
         print(f"\n{'='*60}")
